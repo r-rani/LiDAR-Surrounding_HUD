@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.8)
+project(point_cloud_processing)
+
+# Use C++14 (safe for PCL + ROS2)
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 14)
+endif()
+
+# Core ament / ROS2 + PCL
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)          # if later you turn it into a node
+find_package(sensor_msgs REQUIRED)     # optional but common with point clouds
+find_package(PCL REQUIRED COMPONENTS common filters io)
+
+# PCL includes / definitions
+include_directories(${PCL_INCLUDE_DIRS})
+add_definitions(${PCL_DEFINITIONS})
+
+# ---------- Executable ----------
+# This name ("pcd_import") is what you will use with `ros2 run`
+add_executable(pcd_import src/0_table_scene.cpp)
+
+# Attach ROS2 deps (even if your main is empty for now, this is fine)
+ament_target_dependencies(pcd_import
+  rclcpp
+  sensor_msgs
+)
+
+# Link against PCL libs
+target_link_libraries(pcd_import
+  ${PCL_LIBRARIES}
+)
+
+# Install so ROS2 can find it
+install(TARGETS
+  pcd_import
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+ament_package()
