@@ -1,14 +1,11 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
-
 #include <visualization_msgs/MarkerArray.h>
-#include <visualization_msgs/Marker.h>
+
+#include <pcl_ros/point_cloud.h>
+#include <pcl_conversions/pcl_conversions.h>
 
 #include <pcl/point_types.h>
-#include <pcl/point_cloud.h>
-#include <pcl_conversions/pcl_conversions.h>
-#include <pcl_ros/point_cloud.h>
-
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/search/kdtree.h>
@@ -17,181 +14,135 @@
 class UnitreeOutlines
 {
 public:
-  UnitreeOutlines()
-  {
-    ros::NodeHandle pnh("~");
+    UnitreeOutlines()
+    {
+        ros::NodeHandle nh("~");
 
-    pnh.param<std::string>("input_topic", input_topic_, std::string("/unilidar/cloud"));
-    pnh.param<std::string>("marker_topic", marker_topic_, std::string("/unitree_outlines/markers"));
+        nh.param<std::string>("input_topic", input_topic_, "/unilidar/cloud");
+        nh.param<std::string>("marker_topic", marker_topic_, "/unitree/outlines");
 
-    pnh.param<double>("voxel_leaf", voxel_leaf_, 0.10);     // meters
-    pnh.param<double>("z_min", z_min_, -2.0);
-    pnh.param<double>("z_max", z_max_,  2.0);
+        nh.param("voxel_leaf", voxel_leaf_, 0.15);
+        nh.param("z_min", z_min_, -1.0);
+        nh.param("z_max", z_max_, 2.0);
+        nh.param("cluster_tol", cluster_tol_, 0.5);
+        nh.param("cluster_min", cluster_min_, 30);
+        nh.param("cluster_max", cluster_max_, 2000);
 
-    pnh.param<double>("cluster_tolerance", cluster_tol_, 0.35); // meters
-    pnh.param<int>("cluster_min_size", cluster_min_size_, 40);
-    pnh.param<int>("cluster_max_size", cluster_max_size_, 20000);
+        sub_ = nh.subscribe(input_topic_, 1, &UnitreeOutlines::cloudCallback, this);
+        pub_ = nh.advertise<visualization_msgs::MarkerArray>(marker_topic_, 1);
 
-    sub_ = nh_.subscribe(input_topic_, 1, &UnitreeOutlines::cloudCb, this);
-    pub_markers_ = nh_.advertise<visualization_msgs::MarkerArray>(marker_topic_, 1);
-
-    ROS_INFO("unitree_outlines node started");
-    ROS_INFO("Subscribing to: %s", input_topic_.c_str());
-    ROS_INFO("Publishing markers to: %s", marker_topic_.c_str());
-  }
+        ROS_INFO("Unitree outlines node started");
+        ROS_INFO("Subscribing to: %s", input_topic_.c_str());
+        ROS_INFO("Publishing markers on: %s", marker_topic_.c_str());
+    }
 
 private:
-  ros::NodeHandle nh_;
-  ros::Subscriber sub_;
-  ros::Publisher pub_markers_;
+    ros::Subscriber sub_;
+    ros::Publisher pub_;
 
-  std::string input_topic_;
-  std::string marker_topic_;
+    std::string input_topic_;
+    std::string marker_topic_;
 
-  double voxel_leaf_;
-  double z_min_, z_max_;
-  double cluster_tol_;
-  int cluster_min_size_;
-  int cluster_max_size_;
+    double voxel_leaf_;
+    double z_min_;
+    double z_max_;
+    double cluster_tol_;
+    int cluster_min_;
+    int cluster_max_;
 
-  void cloudCb(const sensor_msgs::PointCloud2ConstPtr& msg)
-  {
-    // Convert ROS -> PCL
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
-    pcl::fromROSMsg(*msg, *cloud);
-
-    if (cloud->empty())
+    void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
     {
-      ROS_WARN_THROTTLE(1.0, "Received empty cloud");
-      return;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::fromROSMsg(*msg, *cloud);
+
+        if (cloud->empty())
+            return;
+
+        // Downsample
+        pcl::VoxelGrid<pcl::PointXYZ> vg;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ds(new pcl::PointCloud<pcl::PointXYZ>);
+        vg.setInputCloud(cloud);
+        vg.setLeafSize(voxel_leaf_, voxel_leaf_, voxel_leaf_);
+        vg.filter(*cloud_ds);
+
+        // Z filter
+        pcl::PassThrough<pcl::PointXYZ> pass;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_f(new pcl::PointCloud<pcl::PointXYZ>);
+        pass.setInputCloud(cloud_ds);
+        pass.setFilterFieldName("z");
+        pass.setFilterLimits(z_min_, z_max_);
+        pass.filter(*cloud_f);
+
+        if (cloud_f->size() < 20)
+            return;
+
+        // Clustering
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(cloud_f);
+
+        std::vector<pcl::PointIndices> cluster_indices;
+        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+        ec.setClusterTolerance(cluster_tol_);
+        ec.setMinClusterSize(cluster_min_);
+        ec.setMaxClusterSize(cluster_max_);
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(cloud_f);
+        ec.extract(cluster_indices);
+
+        visualization_msgs::MarkerArray markers;
+        int id = 0;
+
+        for (const auto& cluster : cluster_indices)
+        {
+            float min_x = 1e9, min_y = 1e9, min_z = 1e9;
+            float max_x = -1e9, max_y = -1e9, max_z = -1e9;
+
+            for (int idx : cluster.indices)
+            {
+                const auto& p = cloud_f->points[idx];
+                min_x = std::min(min_x, p.x);
+                min_y = std::min(min_y, p.y);
+                min_z = std::min(min_z, p.z);
+                max_x = std::max(max_x, p.x);
+                max_y = std::max(max_y, p.y);
+                max_z = std::max(max_z, p.z);
+            }
+
+            visualization_msgs::Marker box;
+            box.header = msg->header;
+            box.ns = "unitree_boxes";
+            box.id = id++;
+            box.type = visualization_msgs::Marker::CUBE;
+            box.action = visualization_msgs::Marker::ADD;
+
+            box.pose.position.x = (min_x + max_x) / 2.0;
+            box.pose.position.y = (min_y + max_y) / 2.0;
+            box.pose.position.z = (min_z + max_z) / 2.0;
+
+            box.pose.orientation.w = 1.0;
+
+            box.scale.x = (max_x - min_x);
+            box.scale.y = (max_y - min_y);
+            box.scale.z = (max_z - min_z);
+
+            box.color.r = 1.0;
+            box.color.g = 0.0;
+            box.color.b = 0.0;
+            box.color.a = 0.6;
+
+            box.lifetime = ros::Duration(0.1);
+
+            markers.markers.push_back(box);
+        }
+
+        pub_.publish(markers);
     }
-
-    // Downsample (VoxelGrid)
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_ds(new pcl::PointCloud<pcl::PointXYZI>);
-    pcl::VoxelGrid<pcl::PointXYZI> vg;
-    vg.setInputCloud(cloud);
-    vg.setLeafSize((float)voxel_leaf_, (float)voxel_leaf_, (float)voxel_leaf_);
-    vg.filter(*cloud_ds);
-
-    // Simple Z pass-through (keeps a slab)
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_f(new pcl::PointCloud<pcl::PointXYZI>);
-    pcl::PassThrough<pcl::PointXYZI> pass;
-    pass.setInputCloud(cloud_ds);
-    pass.setFilterFieldName("z");
-    pass.setFilterLimits((float)z_min_, (float)z_max_);
-    pass.filter(*cloud_f);
-
-    if (cloud_f->size() < 20)
-    {
-      ROS_WARN_THROTTLE(1.0, "Filtered cloud too small (%zu)", cloud_f->size());
-      publishEmpty(msg->header);
-      return;
-    }
-
-    // Clustering
-    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZI>);
-    tree->setInputCloud(cloud_f);
-
-    std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<pcl::PointXYZI> ec;
-    ec.setClusterTolerance((float)cluster_tol_);
-    ec.setMinClusterSize(cluster_min_size_);
-    ec.setMaxClusterSize(cluster_max_size_);
-    ec.setSearchMethod(tree);
-    ec.setInputCloud(cloud_f);
-    ec.extract(cluster_indices);
-
-    visualization_msgs::MarkerArray out;
-    out.markers.reserve(cluster_indices.size() + 1);
-
-    // Add a "delete all" marker so RViz clears old ones
-    visualization_msgs::Marker clear;
-    clear.header = msg->header;
-    clear.ns = "unitree_outlines";
-    clear.id = 0;
-    clear.action = visualization_msgs::Marker::DELETEALL;
-    out.markers.push_back(clear);
-
-    int id = 1;
-    for (const auto& inds : cluster_indices)
-    {
-      // Compute XY bounding box for this cluster
-      double min_x =  1e9, min_y =  1e9;
-      double max_x = -1e9, max_y = -1e9;
-
-      for (int idx : inds.indices)
-      {
-        const auto& p = cloud_f->points[idx];
-        if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
-
-        if (p.x < min_x) min_x = p.x;
-        if (p.y < min_y) min_y = p.y;
-        if (p.x > max_x) max_x = p.x;
-        if (p.y > max_y) max_y = p.y;
-      }
-
-      if (min_x > max_x || min_y > max_y) continue;
-
-      visualization_msgs::Marker m;
-      m.header = msg->header;
-      m.ns = "unitree_outlines";
-      m.id = id++;
-      m.type = visualization_msgs::Marker::LINE_STRIP;
-      m.action = visualization_msgs::Marker::ADD;
-
-      // Line width
-      m.scale.x = 0.05;
-
-      // Color (green)
-      m.color.r = 0.1f;
-      m.color.g = 1.0f;
-      m.color.b = 0.1f;
-      m.color.a = 1.0f;
-
-      // Put rectangle at z=0 in the cloud frame (or use msg frame)
-      double z = 0.0;
-
-      geometry_msgs::Point p1; p1.x = min_x; p1.y = min_y; p1.z = z;
-      geometry_msgs::Point p2; p2.x = max_x; p2.y = min_y; p2.z = z;
-      geometry_msgs::Point p3; p3.x = max_x; p3.y = max_y; p3.z = z;
-      geometry_msgs::Point p4; p4.x = min_x; p4.y = max_y; p4.z = z;
-
-      // Close the loop
-      m.points.push_back(p1);
-      m.points.push_back(p2);
-      m.points.push_back(p3);
-      m.points.push_back(p4);
-      m.points.push_back(p1);
-
-      // Short lifetime so it updates smoothly
-      m.lifetime = ros::Duration(0.2);
-
-      out.markers.push_back(m);
-    }
-
-    pub_markers_.publish(out);
-
-    ROS_INFO_THROTTLE(1.0, "Cloud in: %zu  filtered: %zu  clusters: %zu",
-                      cloud->size(), cloud_f->size(), cluster_indices.size());
-  }
-
-  void publishEmpty(const std_msgs::Header& header)
-  {
-    visualization_msgs::MarkerArray out;
-    visualization_msgs::Marker clear;
-    clear.header = header;
-    clear.ns = "unitree_outlines";
-    clear.id = 0;
-    clear.action = visualization_msgs::Marker::DELETEALL;
-    out.markers.push_back(clear);
-    pub_markers_.publish(out);
-  }
 };
 
 int main(int argc, char** argv)
 {
-  ros::init(argc, argv, "unitree_outlines");
-  UnitreeOutlines node;
-  ros::spin();
-  return 0;
+    ros::init(argc, argv, "unitree_outlines");
+    UnitreeOutlines node;
+    ros::spin();
+    return 0;
 }
