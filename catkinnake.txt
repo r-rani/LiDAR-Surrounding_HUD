@@ -6,21 +6,16 @@ add_compile_options(-std=c++11)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   sensor_msgs
+  visualization_msgs
   pcl_ros
   pcl_conversions
-  visualization_msgs
 )
 
-catkin_package(
-  CATKIN_DEPENDS roscpp sensor_msgs pcl_ros pcl_conversions visualization_msgs
-)
+catkin_package()
 
 include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
-add_executable(unitree_outlines src/outlines.cpp)
-
-target_link_libraries(unitree_outlines
-  ${catkin_LIBRARIES}
-)
+add_executable(object_outlines src/outlines.cpp)
+target_link_libraries(object_outlines ${catkin_LIBRARIES})
