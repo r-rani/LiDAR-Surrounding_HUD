@@ -1,148 +1,246 @@
+// outlines.cpp (ROS1 / Melodic)
+// Subscribes to a PointCloud2 (ex: /unilidar/cloud), clusters objects, and publishes
+// clean *wireframe* bounding-box outlines as visualization_msgs/MarkerArray.
+//
+// RViz: Add -> "MarkerArray" and select topic "/unitree/outlines"
+
 #include <ros/ros.h>
+
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include <pcl_ros/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl_ros/point_cloud.h>
 
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/search/kdtree.h>
 #include <pcl/segmentation/extract_clusters.h>
+#include <pcl/common/common.h>
 
 class UnitreeOutlines
 {
 public:
-    UnitreeOutlines()
-    {
-        ros::NodeHandle nh("~");
+  UnitreeOutlines()
+  : pnh_("~")
+  {
+    // ---- Parameters (can be set in roslaunch / rosparam) ----
+    pnh_.param<std::string>("input_topic", input_topic_, std::string("/unilidar/cloud"));
+    pnh_.param<std::string>("marker_topic", marker_topic_, std::string("/unitree/outlines"));
 
-        nh.param<std::string>("input_topic", input_topic_, "/unilidar/cloud");
-        nh.param<std::string>("marker_topic", marker_topic_, "/unitree/outlines");
+    pnh_.param<double>("voxel_leaf", voxel_leaf_, 0.10);     // meters
+    pnh_.param<double>("z_min", z_min_, -1.0);               // meters
+    pnh_.param<double>("z_max", z_max_,  2.0);               // meters
 
-        nh.param("voxel_leaf", voxel_leaf_, 0.15);
-        nh.param("z_min", z_min_, -1.0);
-        nh.param("z_max", z_max_, 2.0);
-        nh.param("cluster_tol", cluster_tol_, 0.5);
-        nh.param("cluster_min", cluster_min_, 30);
-        nh.param("cluster_max", cluster_max_, 2000);
+    pnh_.param<double>("cluster_tol", cluster_tol_, 0.45);   // meters
+    pnh_.param<int>("cluster_min_size", cluster_min_size_, 50);
+    pnh_.param<int>("cluster_max_size", cluster_max_size_, 200000);
 
-        sub_ = nh.subscribe(input_topic_, 1, &UnitreeOutlines::cloudCallback, this);
-        pub_ = nh.advertise<visualization_msgs::MarkerArray>(marker_topic_, 1);
+    pnh_.param<double>("line_width", line_width_, 0.03);     // meters in RViz
+    pnh_.param<double>("marker_lifetime", marker_lifetime_, 0.2);
 
-        ROS_INFO("Unitree outlines node started");
-        ROS_INFO("Subscribing to: %s", input_topic_.c_str());
-        ROS_INFO("Publishing markers on: %s", marker_topic_.c_str());
-    }
+    // ---- ROS I/O ----
+    sub_ = nh_.subscribe(input_topic_, 1, &UnitreeOutlines::cloudCb, this);
+    pub_markers_ = nh_.advertise<visualization_msgs::MarkerArray>(marker_topic_, 1);
+
+    ROS_INFO("UnitreeOutlines subscribed to: %s", input_topic_.c_str());
+    ROS_INFO("Publishing MarkerArray to: %s", marker_topic_.c_str());
+  }
 
 private:
-    ros::Subscriber sub_;
-    ros::Publisher pub_;
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
 
-    std::string input_topic_;
-    std::string marker_topic_;
+  ros::Subscriber sub_;
+  ros::Publisher pub_markers_;
 
-    double voxel_leaf_;
-    double z_min_;
-    double z_max_;
-    double cluster_tol_;
-    int cluster_min_;
-    int cluster_max_;
+  std::string input_topic_;
+  std::string marker_topic_;
 
-    void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
+  double voxel_leaf_;
+  double z_min_, z_max_;
+  double cluster_tol_;
+  int cluster_min_size_, cluster_max_size_;
+  double line_width_;
+  double marker_lifetime_;
+
+  static geometry_msgs::Point makePt(float x, float y, float z)
+  {
+    geometry_msgs::Point p;
+    p.x = x; p.y = y; p.z = z;
+    return p;
+  }
+
+  static void addEdge(std::vector<geometry_msgs::Point>& pts,
+                      const geometry_msgs::Point& a,
+                      const geometry_msgs::Point& b)
+  {
+    // LINE_LIST expects pairs of points (a,b) for each segment
+    pts.push_back(a);
+    pts.push_back(b);
+  }
+
+  static visualization_msgs::Marker makeDeleteAll(const std::string& frame_id)
+  {
+    visualization_msgs::Marker m;
+    m.header.frame_id = frame_id;
+    m.header.stamp = ros::Time::now();
+    m.ns = "boxes";
+    m.id = 0;
+    m.action = visualization_msgs::Marker::DELETEALL;
+    return m;
+  }
+
+  visualization_msgs::Marker makeWireBoxMarker(const std::string& frame_id,
+                                               const ros::Time& stamp,
+                                               int id,
+                                               const pcl::PointXYZ& min_pt,
+                                               const pcl::PointXYZ& max_pt) const
+  {
+    // 8 corners of AABB
+    const auto p000 = makePt(min_pt.x, min_pt.y, min_pt.z);
+    const auto p100 = makePt(max_pt.x, min_pt.y, min_pt.z);
+    const auto p110 = makePt(max_pt.x, max_pt.y, min_pt.z);
+    const auto p010 = makePt(min_pt.x, max_pt.y, min_pt.z);
+
+    const auto p001 = makePt(min_pt.x, min_pt.y, max_pt.z);
+    const auto p101 = makePt(max_pt.x, min_pt.y, max_pt.z);
+    const auto p111 = makePt(max_pt.x, max_pt.y, max_pt.z);
+    const auto p011 = makePt(min_pt.x, max_pt.y, max_pt.z);
+
+    visualization_msgs::Marker m;
+    m.header.frame_id = frame_id;
+    m.header.stamp = stamp;
+
+    m.ns = "boxes";
+    m.id = id;
+    m.type = visualization_msgs::Marker::LINE_LIST;
+    m.action = visualization_msgs::Marker::ADD;
+
+    // LINE_LIST uses scale.x as thickness
+    m.scale.x = line_width_;
+
+    // Bright red, fully opaque
+    m.color.r = 1.0f;
+    m.color.g = 0.0f;
+    m.color.b = 0.0f;
+    m.color.a = 1.0f;
+
+    m.pose.orientation.w = 1.0;  // identity
+
+    m.lifetime = ros::Duration(marker_lifetime_);
+
+    // 12 edges
+    // Bottom rectangle
+    addEdge(m.points, p000, p100);
+    addEdge(m.points, p100, p110);
+    addEdge(m.points, p110, p010);
+    addEdge(m.points, p010, p000);
+
+    // Top rectangle
+    addEdge(m.points, p001, p101);
+    addEdge(m.points, p101, p111);
+    addEdge(m.points, p111, p011);
+    addEdge(m.points, p011, p001);
+
+    // Vertical edges
+    addEdge(m.points, p000, p001);
+    addEdge(m.points, p100, p101);
+    addEdge(m.points, p110, p111);
+    addEdge(m.points, p010, p011);
+
+    return m;
+  }
+
+  void cloudCb(const sensor_msgs::PointCloud2ConstPtr& msg)
+  {
+    // Convert ROS -> PCL
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::fromROSMsg(*msg, *cloud_in);
+
+    if (cloud_in->empty())
     {
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::fromROSMsg(*msg, *cloud);
-
-        if (cloud->empty())
-            return;
-
-        // Downsample
-        pcl::VoxelGrid<pcl::PointXYZ> vg;
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ds(new pcl::PointCloud<pcl::PointXYZ>);
-        vg.setInputCloud(cloud);
-        vg.setLeafSize(voxel_leaf_, voxel_leaf_, voxel_leaf_);
-        vg.filter(*cloud_ds);
-
-        // Z filter
-        pcl::PassThrough<pcl::PointXYZ> pass;
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_f(new pcl::PointCloud<pcl::PointXYZ>);
-        pass.setInputCloud(cloud_ds);
-        pass.setFilterFieldName("z");
-        pass.setFilterLimits(z_min_, z_max_);
-        pass.filter(*cloud_f);
-
-        if (cloud_f->size() < 20)
-            return;
-
-        // Clustering
-        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-        tree->setInputCloud(cloud_f);
-
-        std::vector<pcl::PointIndices> cluster_indices;
-        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-        ec.setClusterTolerance(cluster_tol_);
-        ec.setMinClusterSize(cluster_min_);
-        ec.setMaxClusterSize(cluster_max_);
-        ec.setSearchMethod(tree);
-        ec.setInputCloud(cloud_f);
-        ec.extract(cluster_indices);
-
-        visualization_msgs::MarkerArray markers;
-        int id = 0;
-
-        for (const auto& cluster : cluster_indices)
-        {
-            float min_x = 1e9, min_y = 1e9, min_z = 1e9;
-            float max_x = -1e9, max_y = -1e9, max_z = -1e9;
-
-            for (int idx : cluster.indices)
-            {
-                const auto& p = cloud_f->points[idx];
-                min_x = std::min(min_x, p.x);
-                min_y = std::min(min_y, p.y);
-                min_z = std::min(min_z, p.z);
-                max_x = std::max(max_x, p.x);
-                max_y = std::max(max_y, p.y);
-                max_z = std::max(max_z, p.z);
-            }
-
-            visualization_msgs::Marker box;
-            box.header = msg->header;
-            box.ns = "unitree_boxes";
-            box.id = id++;
-            box.type = visualization_msgs::Marker::CUBE;
-            box.action = visualization_msgs::Marker::ADD;
-
-            box.pose.position.x = (min_x + max_x) / 2.0;
-            box.pose.position.y = (min_y + max_y) / 2.0;
-            box.pose.position.z = (min_z + max_z) / 2.0;
-
-            box.pose.orientation.w = 1.0;
-
-            box.scale.x = (max_x - min_x);
-            box.scale.y = (max_y - min_y);
-            box.scale.z = (max_z - min_z);
-
-            box.color.r = 1.0;
-            box.color.g = 0.0;
-            box.color.b = 0.0;
-            box.color.a = 0.6;
-
-            box.lifetime = ros::Duration(0.1);
-
-            markers.markers.push_back(box);
-        }
-
-        pub_.publish(markers);
+      ROS_WARN_THROTTLE(1.0, "Received empty cloud");
+      return;
     }
+
+    // Downsample
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ds(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::VoxelGrid<pcl::PointXYZ> vg;
+    vg.setInputCloud(cloud_in);
+    vg.setLeafSize((float)voxel_leaf_, (float)voxel_leaf_, (float)voxel_leaf_);
+    vg.filter(*cloud_ds);
+
+    // Z passthrough (simple ground/ceiling crop)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_f(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::PassThrough<pcl::PointXYZ> pass;
+    pass.setInputCloud(cloud_ds);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits((float)z_min_, (float)z_max_);
+    pass.filter(*cloud_f);
+
+    if (cloud_f->size() < (size_t)cluster_min_size_)
+    {
+      // Still publish DELETEALL so old boxes disappear
+      visualization_msgs::MarkerArray out;
+      out.markers.push_back(makeDeleteAll(msg->header.frame_id));
+      pub_markers_.publish(out);
+
+      ROS_WARN_THROTTLE(1.0, "Filtered cloud too small: %zu points", cloud_f->size());
+      return;
+    }
+
+    // Clustering
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+    tree->setInputCloud(cloud_f);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(cluster_tol_);
+    ec.setMinClusterSize(cluster_min_size_);
+    ec.setMaxClusterSize(cluster_max_size_);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(cloud_f);
+    ec.extract(cluster_indices);
+
+    // Build MarkerArray
+    visualization_msgs::MarkerArray out;
+
+    // Clear previous markers first (prevents “ghost” boxes)
+    out.markers.push_back(makeDeleteAll(msg->header.frame_id));
+
+    int id = 0;
+    for (const auto& indices : cluster_indices)
+    {
+      pcl::PointCloud<pcl::PointXYZ>::Ptr c(new pcl::PointCloud<pcl::PointXYZ>());
+      c->reserve(indices.indices.size());
+      for (int idx : indices.indices) c->push_back((*cloud_f)[idx]);
+
+      pcl::PointXYZ min_pt, max_pt;
+      pcl::getMinMax3D(*c, min_pt, max_pt);
+
+      // Skip tiny boxes (optional)
+      const float dx = max_pt.x - min_pt.x;
+      const float dy = max_pt.y - min_pt.y;
+      const float dz = max_pt.z - min_pt.z;
+      if (dx < 0.2f && dy < 0.2f && dz < 0.2f) continue;
+
+      out.markers.push_back(
+        makeWireBoxMarker(msg->header.frame_id, msg->header.stamp, id++, min_pt, max_pt)
+      );
+    }
+
+    pub_markers_.publish(out);
+
+    ROS_INFO_THROTTLE(1.0, "Clusters: %zu  (published boxes: %d)", cluster_indices.size(), id);
+  }
 };
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "unitree_outlines");
-    UnitreeOutlines node;
-    ros::spin();
-    return 0;
+  ros::init(argc, argv, "unitree_outlines");
+  UnitreeOutlines node;
+  ros::spin();
+  return 0;
 }
