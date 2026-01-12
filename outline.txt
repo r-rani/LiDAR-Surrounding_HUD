@@ -1,8 +1,6 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
-
 #include <visualization_msgs/MarkerArray.h>
-#include <visualization_msgs/Marker.h>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_types.h>
@@ -10,272 +8,159 @@
 
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>
-#include <pcl/filters/extract_indices.h>
 
-#include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/segmentation/extract_clusters.h>
 #include <pcl/search/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
 
-#include <pcl/common/common.h>   // getMinMax3D
+#include <pcl/common/common.h>
 
 class ObjectOutlines
 {
 public:
-  ObjectOutlines()
-  : nh_("~")
-  {
-    // ---- Params (you can tune later) ----
-    nh_.param<std::string>("input_topic", input_topic_, std::string("/unilidar/cloud"));
-    nh_.param<std::string>("fixed_frame", fixed_frame_override_, std::string("")); // if empty, use msg->header.frame_id
+    ObjectOutlines()
+    {
+        ros::NodeHandle pnh("~");
 
-    nh_.param<double>("voxel_leaf", voxel_leaf_, 0.10);        // downsample (m)
-    nh_.param<double>("z_min", z_min_, -1.0);                  // passthrough z (m)
-    nh_.param<double>("z_max", z_max_,  2.0);
+        pnh.param("input_topic", input_topic_, std::string("/unitree_lidar/cloud"));
+        pnh.param("fixed_frame", fixed_frame_, std::string("unitree_lidar"));
 
-    nh_.param<double>("ground_dist_thresh", ground_dist_thresh_, 0.15); // RANSAC plane distance (m)
+        pnh.param("voxel_leaf", voxel_leaf_, 0.03);
+        pnh.param("z_min", z_min_, 0.2);
+        pnh.param("z_max", z_max_, 2.5);
 
-    nh_.param<double>("cluster_tol", cluster_tol_, 0.50);      // cluster distance (m)
-    nh_.param<int>("cluster_min", cluster_min_, 40);
-    nh_.param<int>("cluster_max", cluster_max_, 40000);
+        pnh.param("cluster_tol", cluster_tol_, 0.35);
+        pnh.param("cluster_min", cluster_min_, 15);
+        pnh.param("cluster_max", cluster_max_, 40000);
 
-    // ---- ROS pub/sub ----
-    sub_ = nh_.subscribe(input_topic_, 1, &ObjectOutlines::cloudCb, this);
+        sub_ = nh_.subscribe(input_topic_, 1, &ObjectOutlines::cloudCallback, this);
+        marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/detected_objects", 1);
 
-    boxes_pub_  = nh_.advertise<visualization_msgs::MarkerArray>("/detected_objects/boxes", 1);
-    labels_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/detected_objects/labels", 1);
-    cloud_pub_  = nh_.advertise<sensor_msgs::PointCloud2>("/detected_objects/cloud_filtered", 1);
-
-    ROS_INFO("ObjectOutlines subscribed to: %s", input_topic_.c_str());
-  }
+        ROS_INFO("ObjectOutlines running. Subscribed to %s", input_topic_.c_str());
+    }
 
 private:
-  ros::NodeHandle nh_;
-  ros::Subscriber sub_;
+    ros::NodeHandle nh_;
+    ros::Subscriber sub_;
+    ros::Publisher marker_pub_;
 
-  ros::Publisher boxes_pub_;
-  ros::Publisher labels_pub_;
-  ros::Publisher cloud_pub_;
+    std::string input_topic_;
+    std::string fixed_frame_;
 
-  std::string input_topic_;
-  std::string fixed_frame_override_;
+    double voxel_leaf_;
+    double z_min_, z_max_;
+    double cluster_tol_;
+    int cluster_min_, cluster_max_;
 
-  double voxel_leaf_;
-  double z_min_, z_max_;
-  double ground_dist_thresh_;
-  double cluster_tol_;
-  int cluster_min_, cluster_max_;
-
-  void cloudCb(const sensor_msgs::PointCloud2ConstPtr& msg)
-  {
-    // ----- Pick frame that RViz must use -----
-    const std::string frame_id = (fixed_frame_override_.empty())
-      ? msg->header.frame_id
-      : fixed_frame_override_;
-
-    if (frame_id.empty())
+    void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
     {
-      ROS_WARN_THROTTLE(1.0, "Incoming cloud has empty header.frame_id. RViz cannot display markers without a frame.");
-      return;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::fromROSMsg(*msg, *cloud);
+
+        if (cloud->empty()) return;
+
+        // --- Downsample ---
+        pcl::VoxelGrid<pcl::PointXYZ> vg;
+        vg.setLeafSize(voxel_leaf_, voxel_leaf_, voxel_leaf_);
+        vg.setInputCloud(cloud);
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ds(new pcl::PointCloud<pcl::PointXYZ>);
+        vg.filter(*cloud_ds);
+
+        // --- Z filter (remove ground/ceiling) ---
+        pcl::PassThrough<pcl::PointXYZ> pass;
+        pass.setInputCloud(cloud_ds);
+        pass.setFilterFieldName("z");
+        pass.setFilterLimits(z_min_, z_max_);
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_f(new pcl::PointCloud<pcl::PointXYZ>);
+        pass.filter(*cloud_f);
+
+        if (cloud_f->size() < 10) return;
+
+        // --- Clustering ---
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(cloud_f);
+
+        std::vector<pcl::PointIndices> cluster_indices;
+
+        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+        ec.setClusterTolerance(cluster_tol_);
+        ec.setMinClusterSize(cluster_min_);
+        ec.setMaxClusterSize(cluster_max_);
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(cloud_f);
+        ec.extract(cluster_indices);
+
+        visualization_msgs::MarkerArray markers;
+
+        int id = 0;
+
+        for (const auto& indices : cluster_indices)
+        {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
+            for (int idx : indices.indices)
+                cluster->push_back((*cloud_f)[idx]);
+
+            pcl::PointXYZ min_pt, max_pt;
+            pcl::getMinMax3D(*cluster, min_pt, max_pt);
+
+            float width  = max_pt.y - min_pt.y;
+            float depth  = max_pt.x - min_pt.x;
+            float height = max_pt.z - min_pt.z;
+
+            // Ignore walls
+            if (width > 3.0 || depth > 3.0)
+                continue;
+
+            bool is_person =
+                height > 1.2 && height < 2.2 &&
+                width  < 1.0 &&
+                depth  < 1.0;
+
+            visualization_msgs::Marker box;
+            box.header.frame_id = fixed_frame_;
+            box.header.stamp = ros::Time::now();
+            box.ns = is_person ? "person" : "obstacle";
+            box.id = id++;
+            box.type = visualization_msgs::Marker::CUBE;
+            box.action = visualization_msgs::Marker::ADD;
+
+            box.pose.position.x = (min_pt.x + max_pt.x) / 2.0;
+            box.pose.position.y = (min_pt.y + max_pt.y) / 2.0;
+            box.pose.position.z = (min_pt.z + max_pt.z) / 2.0;
+
+            box.pose.orientation.w = 1.0;
+
+            box.scale.x = depth;
+            box.scale.y = width;
+            box.scale.z = height;
+
+            box.color.a = 0.8;
+
+            if (is_person)
+            {
+                box.color.r = 0.0;
+                box.color.g = 1.0;
+                box.color.b = 0.0;   // GREEN = PERSON
+            }
+            else
+            {
+                box.color.r = 1.0;
+                box.color.g = 0.0;
+                box.color.b = 0.0;   // RED = OBSTACLE
+            }
+
+            markers.markers.push_back(box);
+        }
+
+        marker_pub_.publish(markers);
     }
-
-    // ----- Convert to PCL -----
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::fromROSMsg(*msg, *cloud_in);
-
-    if (cloud_in->empty())
-    {
-      ROS_WARN_THROTTLE(1.0, "Received empty cloud.");
-      return;
-    }
-
-    // ----- Downsample -----
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ds(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::VoxelGrid<pcl::PointXYZ> vg;
-    vg.setInputCloud(cloud_in);
-    vg.setLeafSize((float)voxel_leaf_, (float)voxel_leaf_, (float)voxel_leaf_);
-    vg.filter(*cloud_ds);
-
-    // ----- Z passthrough (keeps usable area) -----
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_z(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PassThrough<pcl::PointXYZ> pass;
-    pass.setInputCloud(cloud_ds);
-    pass.setFilterFieldName("z");
-    pass.setFilterLimits((float)z_min_, (float)z_max_);
-    pass.filter(*cloud_z);
-
-    if (cloud_z->empty())
-    {
-      ROS_WARN_THROTTLE(1.0, "Cloud became empty after Z pass-through. Check z_min/z_max.");
-      return;
-    }
-
-    // ----- Ground removal via plane segmentation -----
-    pcl::SACSegmentation<pcl::PointXYZ> seg;
-    seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PLANE);
-    seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setDistanceThreshold(ground_dist_thresh_);
-    seg.setMaxIterations(100);
-
-    pcl::PointIndices::Ptr ground_inliers(new pcl::PointIndices);
-    pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
-    seg.setInputCloud(cloud_z);
-    seg.segment(*ground_inliers, *coeff);
-
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_noground(new pcl::PointCloud<pcl::PointXYZ>);
-    if (!ground_inliers->indices.empty())
-    {
-      pcl::ExtractIndices<pcl::PointXYZ> ex;
-      ex.setInputCloud(cloud_z);
-      ex.setIndices(ground_inliers);
-      ex.setNegative(true); // remove ground
-      ex.filter(*cloud_noground);
-    }
-    else
-    {
-      // If plane not found, just proceed with cloud_z
-      cloud_noground = cloud_z;
-    }
-
-    if (cloud_noground->empty())
-    {
-      ROS_WARN_THROTTLE(1.0, "Cloud empty after ground removal. Try increasing z_max or adjusting ground_dist_thresh.");
-      return;
-    }
-
-    // ----- Publish filtered cloud (optional but useful to debug) -----
-    sensor_msgs::PointCloud2 out_cloud;
-    pcl::toROSMsg(*cloud_noground, out_cloud);
-    out_cloud.header.stamp = msg->header.stamp;
-    out_cloud.header.frame_id = frame_id;
-    cloud_pub_.publish(out_cloud);
-
-    // ----- Clustering -----
-    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-    tree->setInputCloud(cloud_noground);
-
-    std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-    ec.setClusterTolerance(cluster_tol_);
-    ec.setMinClusterSize(cluster_min_);
-    ec.setMaxClusterSize(cluster_max_);
-    ec.setSearchMethod(tree);
-    ec.setInputCloud(cloud_noground);
-    ec.extract(cluster_indices);
-
-    // ----- Markers -----
-    visualization_msgs::MarkerArray boxes;
-    visualization_msgs::MarkerArray labels;
-
-    int id = 0;
-
-    for (const auto& ci : cluster_indices)
-    {
-      pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
-      cluster->reserve(ci.indices.size());
-      for (int idx : ci.indices) cluster->push_back((*cloud_noground)[idx]);
-
-      pcl::PointXYZ min_pt, max_pt;
-      pcl::getMinMax3D(*cluster, min_pt, max_pt);
-
-      const double dx = (max_pt.x - min_pt.x);
-      const double dy = (max_pt.y - min_pt.y);
-      const double dz = (max_pt.z - min_pt.z);
-
-      // Ignore tiny clusters
-      if (dx < 0.3 && dy < 0.3 && dz < 0.3) continue;
-
-      const double cx = (min_pt.x + max_pt.x) * 0.5;
-      const double cy = (min_pt.y + max_pt.y) * 0.5;
-      const double cz = (min_pt.z + max_pt.z) * 0.5;
-
-      // ---- BOX marker (wireframe) ----
-      visualization_msgs::Marker box;
-      box.header.frame_id = frame_id;
-      box.header.stamp = ros::Time::now();
-      box.ns = "detected_boxes";
-      box.id = id;
-      box.type = visualization_msgs::Marker::CUBE;
-      box.action = visualization_msgs::Marker::ADD;
-
-      box.pose.position.x = cx;
-      box.pose.position.y = cy;
-      box.pose.position.z = cz;
-      box.pose.orientation.w = 1.0;
-
-      box.scale.x = std::max(dx, 0.05);
-      box.scale.y = std::max(dy, 0.05);
-      box.scale.z = std::max(dz, 0.05);
-
-      // Make it a clear outline: semi-transparent fill + strong color
-      box.color.r = 1.0;
-      box.color.g = 0.2;
-      box.color.b = 0.2;
-      box.color.a = 0.35;
-
-      box.lifetime = ros::Duration(0);
-
-      // ---- TEXT label marker ----
-      visualization_msgs::Marker txt;
-      txt.header.frame_id = frame_id;
-      txt.header.stamp = ros::Time::now();
-      txt.ns = "detected_labels";
-      txt.id = id;
-      txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-      txt.action = visualization_msgs::Marker::ADD;
-
-      txt.pose.position.x = cx;
-      txt.pose.position.y = cy;
-      txt.pose.position.z = max_pt.z + 0.3; // above the box
-      txt.pose.orientation.w = 1.0;
-
-      txt.scale.z = 0.4; // text size
-
-      txt.color.r = 1.0;
-      txt.color.g = 1.0;
-      txt.color.b = 1.0;
-      txt.color.a = 1.0;
-
-      // Simple heuristic label (not ML; just size-based)
-      std::string type = "object";
-      if (dx > 2.0 && dy > 0.8) type = "car-ish";
-      else if (dx < 1.0 && dy < 1.0) type = "ped-ish";
-
-      char buf[128];
-      snprintf(buf, sizeof(buf), "%s #%d (%.1fm, %.1fm, %.1fm)", type.c_str(), id, dx, dy, dz);
-      txt.text = buf;
-
-      txt.lifetime = ros::Duration(0);
-
-      boxes.markers.push_back(box);
-      labels.markers.push_back(txt);
-
-      id++;
-      if (id > 200) break; // safety
-    }
-
-    // IMPORTANT: clear old markers by sending DELETEALL (prevents “ghosts”)
-    visualization_msgs::Marker clear;
-    clear.action = visualization_msgs::Marker::DELETEALL;
-
-    visualization_msgs::MarkerArray clearArr;
-    clearArr.markers.push_back(clear);
-    boxes_pub_.publish(clearArr);
-    labels_pub_.publish(clearArr);
-
-    // Publish new
-    boxes_pub_.publish(boxes);
-    labels_pub_.publish(labels);
-
-    ROS_INFO_THROTTLE(1.0, "Clusters: %zu | Published boxes: %zu | frame_id: %s",
-                      cluster_indices.size(), boxes.markers.size(), frame_id.c_str());
-  }
 };
 
 int main(int argc, char** argv)
 {
-  ros::init(argc, argv, "object_outlines");
-  ObjectOutlines node;
-  ros::spin();
-  return 0;
+    ros::init(argc, argv, "object_outlines");
+    ObjectOutlines node;
+    ros::spin();
+    return 0;
 }
