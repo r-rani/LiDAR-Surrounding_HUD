@@ -1,40 +1,10 @@
-cmake_minimum_required(VERSION 3.8)
-project(point_cloud_processing)
-
-# Use C++14 (safe for PCL + ROS2)
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
-endif()
-
-# Core ament / ROS2 + PCL
-find_package(ament_cmake REQUIRED)
-find_package(rclcpp REQUIRED)          # if later you turn it into a node
-find_package(sensor_msgs REQUIRED)     # optional but common with point clouds
-find_package(PCL REQUIRED COMPONENTS common filters io)
-
-# PCL includes / definitions
-include_directories(${PCL_INCLUDE_DIRS})
-add_definitions(${PCL_DEFINITIONS})
-
-# ---------- Executable ----------
-# This name ("pcd_import") is what you will use with `ros2 run`
-add_executable(pcd_import src/0_table_scene.cpp)
-
-# Attach ROS2 deps (even if your main is empty for now, this is fine)
-ament_target_dependencies(pcd_import
-  rclcpp
-  sensor_msgs
-)
-
-# Link against PCL libs
-target_link_libraries(pcd_import
-  ${PCL_LIBRARIES}
-)
-
-# Install so ROS2 can find it
-install(TARGETS
-  pcd_import
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-ament_package()
+rosrun gr14 object_outlines \
+  _input_topic:=/unilidar/cloud \
+  _fixed_frame:=unilidar_lidar \
+  _x_min:=0.5 _x_max:=20.0 \
+  _y_min:=-4.0 _y_max:=4.0 \
+  _z_min:=-1.2 _z_max:=2.2 \
+  _ground_dist_thresh:=0.18 \
+  _cluster_tol:=0.35 \
+  _cluster_min:=120 \
+  _hull_alpha:=0.18
