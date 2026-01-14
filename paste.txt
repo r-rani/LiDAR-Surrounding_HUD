@@ -8,3 +8,6 @@ rosrun gr14 object_outlines \
   _cluster_tol:=0.35 \
   _cluster_min:=120 \
   _hull_alpha:=0.18
+
+
+rosrun gr14 object_outlines _input_topic:=/unilidar/cloud _y_min:=-6 _y_max:=6 _cluster_tol:=0.25 _cluster_min:=40
