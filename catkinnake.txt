@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(gr14)
 
-add_compile_options(-std=c++11)
+add_compile_options(-O3 -std=c++14)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -17,5 +17,5 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
-add_executable(object_outlines src/outlines.cpp)
+add_executable(object_outlines src/object_outlines.cpp)
 target_link_libraries(object_outlines ${catkin_LIBRARIES})
