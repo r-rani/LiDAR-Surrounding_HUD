@@ -1,331 +1,330 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
-
 #include <visualization_msgs/MarkerArray.h>
 #include <visualization_msgs/Marker.h>
-
-#include <pcl/point_types.h>
-#include <pcl/point_cloud.h>
+#include <geometry_msgs/Point.h>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl_ros/point_cloud.h>
 
+#include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/extract_indices.h>
 
+#include <pcl/ModelCoefficients.h>
 #include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/segmentation/extract_clusters.h>
 
+#include <pcl/segmentation/extract_clusters.h>
 #include <pcl/search/kdtree.h>
+
+#include <pcl/surface/concave_hull.h>
 #include <pcl/common/centroid.h>
 
-#include <pcl/surface/convex_hull.h>
+#include <random>
 
-class ObjectOutlinesNode
-{
+class ObjectOutlinesNode {
 public:
-  ObjectOutlinesNode()
-  : nh_("~")
-  {
-    nh_.param<std::string>("input_topic", input_topic_, "/unilidar/cloud");
-    nh_.param<std::string>("fixed_frame", fixed_frame_, "unilidar_lidar");
+  ObjectOutlinesNode() : nh_("~"), marker_seq_(0) {
+    nh_.param<std::string>("input_topic", input_topic_, std::string("/unilidar/cloud"));
+    nh_.param<std::string>("fixed_frame", fixed_frame_, std::string("unilidar_lidar"));
 
-    // Filtering / ROI
-    nh_.param<double>("voxel_leaf", voxel_leaf_, 0.10);      // 0.05–0.15 typical
-    nh_.param<double>("z_min", z_min_, -1.5);
-    nh_.param<double>("z_max", z_max_,  2.5);
-    nh_.param<double>("max_range", max_range_, 30.0);        // meters, optional crop
+    nh_.param<double>("voxel_leaf", voxel_leaf_, 0.08);
 
-    // Ground plane removal
-    nh_.param<double>("ground_dist_thresh", ground_dist_thresh_, 0.15);
-    nh_.param<double>("ground_eps_angle_deg", ground_eps_angle_deg_, 15.0);
+    // ROI cropping (very important to stop “everything in the room”)
+    nh_.param<double>("x_min", x_min_, 0.0);
+    nh_.param<double>("x_max", x_max_, 25.0);
+    nh_.param<double>("y_min", y_min_, -8.0);
+    nh_.param<double>("y_max", y_max_,  8.0);
+    nh_.param<double>("z_min", z_min_, -2.0);
+    nh_.param<double>("z_max", z_max_,  3.0);
 
-    // Remove big planes (walls/tables) after ground removed
-    nh_.param<int>("max_plane_iterations", max_plane_iterations_, 3);
-    nh_.param<int>("min_plane_inliers", min_plane_inliers_, 300); // raise if still removing people
-    nh_.param<double>("plane_dist_thresh", plane_dist_thresh_, 0.12);
+    // Ground removal
+    nh_.param<bool>("remove_ground", remove_ground_, true);
+    nh_.param<double>("ground_dist_thresh", ground_dist_thresh_, 0.12);
+    nh_.param<int>("ground_max_iters", ground_max_iters_, 80);
+
+    // Wall/plane removal (repeat extracting big planes)
+    nh_.param<bool>("remove_big_planes", remove_big_planes_, true);
+    nh_.param<double>("plane_dist_thresh", plane_dist_thresh_, 0.10);
+    nh_.param<int>("plane_max_iters", plane_max_iters_, 80);
+    nh_.param<int>("max_planes_remove", max_planes_remove_, 2);
+    nh_.param<int>("min_plane_inliers", min_plane_inliers_, 800);
 
     // Clustering
-    nh_.param<double>("cluster_tol", cluster_tol_, 0.50);
+    nh_.param<double>("cluster_tol", cluster_tol_, 0.45);
     nh_.param<int>("cluster_min", cluster_min_, 60);
-    nh_.param<int>("cluster_max", cluster_max_, 40000);
+    nh_.param<int>("cluster_max", cluster_max_, 20000);
 
-    // Outline marker thickness
-    nh_.param<double>("line_width", line_width_, 0.08);  // meters
+    // Outline
+    nh_.param<double>("hull_alpha", hull_alpha_, 0.25); // smaller => tighter outline, too small => can fail
 
-    // Reject clusters that are “too big” (usually walls/table blobs)
-    nh_.param<double>("max_cluster_dim_xy", max_cluster_dim_xy_, 6.0); // meters
+    sub_ = nh_.subscribe(input_topic_, 1, &ObjectOutlinesNode::cloudCb, this);
+    pub_markers_ = nh_.advertise<visualization_msgs::MarkerArray>("/detected_outlines", 1);
+    pub_objects_cloud_ = nh_.advertise<sensor_msgs::PointCloud2>("/objects_cloud", 1);
 
-    // Topics out
-    marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/detected_outlines", 1);
-
-    sub_ = nh_.subscribe(input_topic_, 1, &ObjectOutlinesNode::cb, this);
-
-    ROS_INFO("ObjectOutlines subscribed to: %s", input_topic_.c_str());
-    ROS_INFO("Publishing MarkerArray: /detected_outlines");
+    ROS_INFO("ObjectOutlinesNode subscribed to: %s", input_topic_.c_str());
   }
 
 private:
-  using PointT = pcl::PointXYZ;
   ros::NodeHandle nh_;
   ros::Subscriber sub_;
-  ros::Publisher marker_pub_;
+  ros::Publisher pub_markers_;
+  ros::Publisher pub_objects_cloud_;
 
   std::string input_topic_;
   std::string fixed_frame_;
+  int marker_seq_;
 
+  // Params
   double voxel_leaf_;
-  double z_min_, z_max_;
-  double max_range_;
+  double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
 
+  bool remove_ground_;
   double ground_dist_thresh_;
-  double ground_eps_angle_deg_;
+  int ground_max_iters_;
 
-  int max_plane_iterations_;
-  int min_plane_inliers_;
+  bool remove_big_planes_;
   double plane_dist_thresh_;
+  int plane_max_iters_;
+  int max_planes_remove_;
+  int min_plane_inliers_;
 
   double cluster_tol_;
   int cluster_min_, cluster_max_;
+  double hull_alpha_;
 
-  double line_width_;
-  double max_cluster_dim_xy_;
-
-  static double deg2rad(double d) { return d * 3.14159265358979323846 / 180.0; }
-
-  void publishDeleteAll(const std_msgs::Header& hdr)
-  {
-    visualization_msgs::MarkerArray arr;
-    visualization_msgs::Marker m;
-    m.header = hdr;
-    m.header.frame_id = fixed_frame_;
-    m.ns = "outlines";
-    m.id = 0;
-    m.action = visualization_msgs::Marker::DELETEALL;
-    arr.markers.push_back(m);
-    marker_pub_.publish(arr);
+  // Utility: random but stable-ish color per cluster id
+  std_msgs::ColorRGBA colorFor(int id) {
+    std_msgs::ColorRGBA c;
+    std::mt19937 rng(id * 9973);
+    std::uniform_real_distribution<float> dist(0.2f, 1.0f);
+    c.r = dist(rng);
+    c.g = dist(rng);
+    c.b = dist(rng);
+    c.a = 1.0f;
+    return c;
   }
 
-  void cb(const sensor_msgs::PointCloud2ConstPtr& msg)
-  {
-    if (!msg || msg->data.empty())
-      return;
+  void passthrough(pcl::PointCloud<pcl::PointXYZI>::Ptr cloud) {
+    pcl::PassThrough<pcl::PointXYZI> pass;
 
-    // 0) Always publish something so rostopic hz shows activity
-    // (DELETEALL ensures RViz clears stale outlines when no clusters)
-    std_msgs::Header hdr = msg->header;
-    hdr.frame_id = fixed_frame_;
-    publishDeleteAll(hdr);
+    pass.setInputCloud(cloud);
+    pass.setFilterFieldName("x");
+    pass.setFilterLimits(x_min_, x_max_);
+    pass.filter(*cloud);
 
-    // 1) ROS -> PCL
-    pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
-    pcl::fromROSMsg(*msg, *cloud);
-    if (cloud->empty()) return;
+    pass.setInputCloud(cloud);
+    pass.setFilterFieldName("y");
+    pass.setFilterLimits(y_min_, y_max_);
+    pass.filter(*cloud);
 
-    // 2) Voxel downsample
-    pcl::PointCloud<PointT>::Ptr cloud_ds(new pcl::PointCloud<PointT>());
-    pcl::VoxelGrid<PointT> vg;
-    vg.setInputCloud(cloud);
-    vg.setLeafSize((float)voxel_leaf_, (float)voxel_leaf_, (float)voxel_leaf_);
-    vg.filter(*cloud_ds);
-
-    // 3) PassThrough Z (remove ceiling/floor junk)
-    pcl::PointCloud<PointT>::Ptr cloud_z(new pcl::PointCloud<PointT>());
-    pcl::PassThrough<PointT> pass;
-    pass.setInputCloud(cloud_ds);
+    pass.setInputCloud(cloud);
     pass.setFilterFieldName("z");
-    pass.setFilterLimits((float)z_min_, (float)z_max_);
-    pass.filter(*cloud_z);
+    pass.setFilterLimits(z_min_, z_max_);
+    pass.filter(*cloud);
+  }
 
-    if (cloud_z->size() < 50) return;
+  void voxelDownsample(pcl::PointCloud<pcl::PointXYZI>::Ptr cloud) {
+    pcl::VoxelGrid<pcl::PointXYZI> vg;
+    vg.setInputCloud(cloud);
+    vg.setLeafSize(voxel_leaf_, voxel_leaf_, voxel_leaf_);
+    vg.filter(*cloud);
+  }
 
-    // 4) Optional max range crop (in XY)
-    pcl::PointCloud<PointT>::Ptr cloud_roi(new pcl::PointCloud<PointT>());
-    cloud_roi->reserve(cloud_z->size());
-    double r2 = max_range_ * max_range_;
-    for (const auto& p : cloud_z->points)
-    {
-      double d2 = p.x*p.x + p.y*p.y;
-      if (d2 <= r2) cloud_roi->points.push_back(p);
-    }
-    cloud_roi->width = (uint32_t)cloud_roi->points.size();
-    cloud_roi->height = 1;
-    cloud_roi->is_dense = false;
-
-    if (cloud_roi->size() < 50) return;
-
-    // 5) Remove ground plane (prefer plane normal near +Z)
-    pcl::SACSegmentation<PointT> seg;
+  // Remove a single dominant plane; returns number of inliers removed
+  int removeOnePlane(pcl::PointCloud<pcl::PointXYZI>::Ptr cloud, double dist_thresh, int max_iters) {
+    pcl::SACSegmentation<pcl::PointXYZI> seg;
     seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+    seg.setModelType(pcl::SACMODEL_PLANE);
     seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setMaxIterations(120);
-    seg.setDistanceThreshold(ground_dist_thresh_);
+    seg.setMaxIterations(max_iters);
+    seg.setDistanceThreshold(dist_thresh);
 
-    Eigen::Vector3f axis(0.0f, 0.0f, 1.0f);
-    seg.setAxis(axis);
-    seg.setEpsAngle((float)deg2rad(ground_eps_angle_deg_));
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
 
-    pcl::PointIndices::Ptr inliers_ground(new pcl::PointIndices());
-    pcl::ModelCoefficients::Ptr coeff_ground(new pcl::ModelCoefficients());
-    seg.setInputCloud(cloud_roi);
-    seg.segment(*inliers_ground, *coeff_ground);
+    seg.setInputCloud(cloud);
+    seg.segment(*inliers, *coeff);
 
-    pcl::PointCloud<PointT>::Ptr cloud_noground(new pcl::PointCloud<PointT>());
-    if (!inliers_ground->indices.empty())
-    {
-      pcl::ExtractIndices<PointT> ex;
-      ex.setInputCloud(cloud_roi);
-      ex.setIndices(inliers_ground);
-      ex.setNegative(true);
-      ex.filter(*cloud_noground);
-    }
-    else
-    {
-      // If no ground found, keep original ROI (don’t kill everything)
-      cloud_noground = cloud_roi;
-    }
+    if (inliers->indices.empty()) return 0;
 
-    if (cloud_noground->size() < 50) return;
+    pcl::ExtractIndices<pcl::PointXYZI> extract;
+    extract.setInputCloud(cloud);
+    extract.setIndices(inliers);
+    extract.setNegative(true); // remove plane
+    pcl::PointCloud<pcl::PointXYZI>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZI>);
+    extract.filter(*filtered);
+    cloud.swap(filtered);
 
-    // 6) Remove a few largest remaining planes (walls/tables)
-    pcl::PointCloud<PointT>::Ptr cloud_noplanes(new pcl::PointCloud<PointT>(*cloud_noground));
+    return (int)inliers->indices.size();
+  }
 
-    pcl::SACSegmentation<PointT> seg_plane;
-    seg_plane.setOptimizeCoefficients(true);
-    seg_plane.setModelType(pcl::SACMODEL_PLANE);
-    seg_plane.setMethodType(pcl::SAC_RANSAC);
-    seg_plane.setMaxIterations(80);
-    seg_plane.setDistanceThreshold(plane_dist_thresh_);
+  void cloudCb(const sensor_msgs::PointCloud2ConstPtr& msg) {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_raw(new pcl::PointCloud<pcl::PointXYZI>);
+    pcl::fromROSMsg(*msg, *cloud_raw);
 
-    for (int it = 0; it < max_plane_iterations_; ++it)
-    {
-      if ((int)cloud_noplanes->size() < min_plane_inliers_) break;
+    if (cloud_raw->empty()) return;
 
-      pcl::PointIndices::Ptr inliers_plane(new pcl::PointIndices());
-      pcl::ModelCoefficients::Ptr coeff_plane(new pcl::ModelCoefficients());
-      seg_plane.setInputCloud(cloud_noplanes);
-      seg_plane.segment(*inliers_plane, *coeff_plane);
+    // 1) Crop to ROI
+    passthrough(cloud_raw);
 
-      if ((int)inliers_plane->indices.size() < min_plane_inliers_)
-        break;
+    // 2) Downsample
+    voxelDownsample(cloud_raw);
 
-      // Remove this plane
-      pcl::ExtractIndices<PointT> ex;
-      ex.setInputCloud(cloud_noplanes);
-      ex.setIndices(inliers_plane);
-      ex.setNegative(true);
+    if (cloud_raw->size() < 50) return;
 
-      pcl::PointCloud<PointT>::Ptr tmp(new pcl::PointCloud<PointT>());
-      ex.filter(*tmp);
-      cloud_noplanes = tmp;
+    // 3) Remove ground plane (dominant plane)
+    if (remove_ground_) {
+      int removed = removeOnePlane(cloud_raw, ground_dist_thresh_, ground_max_iters_);
+      // If you keep seeing "Not enough inliers", increase ground_dist_thresh or ensure ROI includes ground.
+      (void)removed;
     }
 
-    if (cloud_noplanes->size() < 50) return;
+    // 4) Remove a couple more big planes (often walls/large table faces)
+    if (remove_big_planes_) {
+      for (int i = 0; i < max_planes_remove_; i++) {
+        int removed = removeOnePlane(cloud_raw, plane_dist_thresh_, plane_max_iters_);
+        if (removed < min_plane_inliers_) break;
+      }
+    }
 
-    // 7) Euclidean clustering
-    pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>());
-    tree->setInputCloud(cloud_noplanes);
+    if (cloud_raw->size() < (size_t)cluster_min_) {
+      publishEmptyMarkers(msg->header);
+      return;
+    }
+
+    // 5) Euclidean clustering
+    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZI>);
+    tree->setInputCloud(cloud_raw);
 
     std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<PointT> ec;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZI> ec;
     ec.setClusterTolerance(cluster_tol_);
     ec.setMinClusterSize(cluster_min_);
     ec.setMaxClusterSize(cluster_max_);
     ec.setSearchMethod(tree);
-    ec.setInputCloud(cloud_noplanes);
+    ec.setInputCloud(cloud_raw);
     ec.extract(cluster_indices);
 
-    // 8) Build outlines (2D convex hull in XY for each cluster)
-    visualization_msgs::MarkerArray arr;
+    // 6) Publish colored clusters cloud (for debugging clarity)
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>);
+    colored->reserve(cloud_raw->size());
 
+    visualization_msgs::MarkerArray marr;
     int id = 0;
-    for (const auto& ci : cluster_indices)
-    {
-      pcl::PointCloud<PointT>::Ptr cluster(new pcl::PointCloud<PointT>());
-      cluster->reserve(ci.indices.size());
-      for (int idx : ci.indices) cluster->points.push_back(cloud_noplanes->points[idx]);
-      cluster->width = (uint32_t)cluster->points.size();
-      cluster->height = 1;
 
-      if (cluster->size() < 10) continue;
+    for (const auto& cidx : cluster_indices) {
+      // Build cluster cloud
+      pcl::PointCloud<pcl::PointXYZI>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZI>);
+      cluster->reserve(cidx.indices.size());
+      for (int idx_pt : cidx.indices) cluster->push_back((*cloud_raw)[idx_pt]);
 
-      // Compute rough XY bounds (reject huge blobs)
-      float minx=1e9f,maxx=-1e9f,miny=1e9f,maxy=-1e9f;
-      for (auto& p : cluster->points)
-      {
-        if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
-        if (p.y < miny) miny = p.y; if (p.y > maxy) maxy = p.y;
+      // Centroid
+      Eigen::Vector4f centroid;
+      pcl::compute3DCentroid(*cluster, centroid);
+
+      // Add to colored cloud
+      auto col = colorFor(id);
+      for (const auto& p : cluster->points) {
+        pcl::PointXYZRGB q;
+        q.x = p.x; q.y = p.y; q.z = p.z;
+        q.r = (uint8_t)(255.0f * col.r);
+        q.g = (uint8_t)(255.0f * col.g);
+        q.b = (uint8_t)(255.0f * col.b);
+        colored->push_back(q);
       }
-      float dx = maxx - minx, dy = maxy - miny;
-      if (dx > (float)max_cluster_dim_xy_ || dy > (float)max_cluster_dim_xy_)
-        continue;
 
-      // Project to ground (z=0) for a road-map outline
-      pcl::PointCloud<PointT>::Ptr cluster_xy(new pcl::PointCloud<PointT>());
+      // 7) Outline via Concave Hull
+      // Project to XY by flattening Z (makes road-like top-down outlines stable)
+      pcl::PointCloud<pcl::PointXYZ>::Ptr cluster_xy(new pcl::PointCloud<pcl::PointXYZ>);
       cluster_xy->reserve(cluster->size());
-      for (auto p : cluster->points)
-      {
-        p.z = 0.0f;
-        cluster_xy->points.push_back(p);
+      for (const auto& p : cluster->points) {
+        pcl::PointXYZ q;
+        q.x = p.x; q.y = p.y; q.z = 0.0f;
+        cluster_xy->push_back(q);
       }
-      cluster_xy->width = (uint32_t)cluster_xy->points.size();
-      cluster_xy->height = 1;
 
-      // Convex hull (2D)
-      pcl::ConvexHull<PointT> chull;
-      chull.setInputCloud(cluster_xy);
-      chull.setDimension(2);
-
-      pcl::PointCloud<PointT>::Ptr hull(new pcl::PointCloud<PointT>());
+      pcl::PointCloud<pcl::PointXYZ>::Ptr hull(new pcl::PointCloud<pcl::PointXYZ>);
       std::vector<pcl::Vertices> polygons;
-      try {
-        chull.reconstruct(*hull, polygons);
-      } catch (...) {
-        continue;
+
+      pcl::ConcaveHull<pcl::PointXYZ> chull;
+      chull.setInputCloud(cluster_xy);
+      chull.setAlpha(hull_alpha_);
+      chull.reconstruct(*hull, polygons);
+
+      if (hull->size() >= 3) {
+        // LINE_STRIP outline marker
+        visualization_msgs::Marker outline;
+        outline.header = msg->header;
+        outline.header.frame_id = fixed_frame_;
+        outline.ns = "outlines";
+        outline.id = id;
+        outline.type = visualization_msgs::Marker::LINE_STRIP;
+        outline.action = visualization_msgs::Marker::ADD;
+        outline.scale.x = 0.06;  // line thickness
+        outline.color = col;
+
+        for (const auto& hp : hull->points) {
+          geometry_msgs::Point gp;
+          gp.x = hp.x; gp.y = hp.y; gp.z = 0.0;
+          outline.points.push_back(gp);
+        }
+        // close loop
+        outline.points.push_back(outline.points.front());
+        outline.lifetime = ros::Duration(0.2);
+        marr.markers.push_back(outline);
+
+        // TEXT label marker at centroid
+        visualization_msgs::Marker label;
+        label.header = outline.header;
+        label.ns = "labels";
+        label.id = 10000 + id;
+        label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        label.action = visualization_msgs::Marker::ADD;
+        label.pose.position.x = centroid[0];
+        label.pose.position.y = centroid[1];
+        label.pose.position.z = 0.8; // float above ground
+        label.scale.z = 0.5;
+        label.color.r = 1.0; label.color.g = 1.0; label.color.b = 1.0; label.color.a = 1.0;
+
+        // quick “size hint”
+        // (not true classification, but helps: “small blob” vs “wide blob”)
+        label.text = "obj_" + std::to_string(id) + " pts=" + std::to_string(cluster->size());
+        label.lifetime = ros::Duration(0.2);
+        marr.markers.push_back(label);
       }
 
-      if (hull->size() < 3) continue;
-
-      // Marker: LINE_STRIP (closed)
-      visualization_msgs::Marker m;
-      m.header = hdr;
-      m.header.frame_id = fixed_frame_;
-      m.ns = "outlines";
-      m.id = id++;
-      m.type = visualization_msgs::Marker::LINE_STRIP;
-      m.action = visualization_msgs::Marker::ADD;
-
-      // IMPORTANT: avoid “Uninitialized quaternion” warnings
-      m.pose.orientation.w = 1.0;
-
-      m.scale.x = line_width_; // line thickness
-      m.color.r = 0.0f;
-      m.color.g = 1.0f;
-      m.color.b = 0.0f;
-      m.color.a = 1.0f;
-
-      // Add hull points, then close loop
-      for (const auto& hp : hull->points)
-      {
-        geometry_msgs::Point gp;
-        gp.x = hp.x; gp.y = hp.y; gp.z = 0.05; // slightly above ground
-        m.points.push_back(gp);
-      }
-      m.points.push_back(m.points.front());
-
-      arr.markers.push_back(m);
+      id++;
+      if (id > 50) break; // safety
     }
 
-    // Publish outlines (even empty array is fine; we already sent DELETEALL)
-    if (!arr.markers.empty())
-      marker_pub_.publish(arr);
+    // Publish markers
+    pub_markers_.publish(marr);
+
+    // Publish colored cloud
+    colored->header.frame_id = fixed_frame_;
+    sensor_msgs::PointCloud2 out_msg;
+    pcl::toROSMsg(*colored, out_msg);
+    out_msg.header = msg->header;
+    out_msg.header.frame_id = fixed_frame_;
+    pub_objects_cloud_.publish(out_msg);
+  }
+
+  void publishEmptyMarkers(const std_msgs::Header& hdr) {
+    visualization_msgs::MarkerArray marr;
+
+    // delete old markers so RViz doesn’t keep stale outlines
+    visualization_msgs::Marker del;
+    del.header = hdr;
+    del.header.frame_id = fixed_frame_;
+    del.action = visualization_msgs::Marker::DELETEALL;
+    marr.markers.push_back(del);
+    pub_markers_.publish(marr);
   }
 };
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv) {
   ros::init(argc, argv, "object_outlines");
   ObjectOutlinesNode n;
   ros::spin();
