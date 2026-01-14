@@ -11,3 +11,21 @@ rosrun gr14 object_outlines \
 
 
 rosrun gr14 object_outlines _input_topic:=/unilidar/cloud _y_min:=-6 _y_max:=6 _cluster_tol:=0.25 _cluster_min:=40
+
+cd ~/group14
+source devel/setup.bash
+
+rosrun gr14 object_outlines \
+  _input_topic:=/unilidar/cloud \
+  _fixed_frame:=unilidar_lidar \
+  _voxel_leaf:=0.06 \
+  _x_min:=0.5 _x_max:=25.0 \
+  _y_min:=-8.0 _y_max:=8.0 \
+  _z_min:=-2.0 _z_max:=2.0 \
+  _ground_dist_thresh:=0.12 \
+  _ground_eps_angle_deg:=10.0 \
+  _wall_dist_thresh:=0.10 \
+  _min_wall_inliers:=250 \
+  _cluster_tolerance:=0.30 \
+  _cluster_min_size:=120 \
+  _hull_alpha:=0.20
