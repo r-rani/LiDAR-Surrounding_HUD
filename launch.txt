@@ -1,0 +1,40 @@
+<launch>
+  <!-- TF FIX: create a TF so RViz has a stable world frame -->
+  <!-- Map -> unilidar_lidar (identity). You can change "map" to "base_link" later. -->
+  <node pkg="tf" type="static_transform_publisher" name="map_to_lidar"
+        args="0 0 0 0 0 0 map unilidar_lidar 100" />
+
+  <node pkg="gr14" type="object_boxes_tracker" name="object_boxes_tracker" output="screen">
+    <param name="input_topic" value="/unilidar/cloud" />
+    <param name="frame_override" value="unilidar_lidar" />
+
+    <!-- Filtering -->
+    <param name="voxel_leaf" value="0.08" />
+    <param name="roi_x_min" value="0.5" />
+    <param name="roi_x_max" value="25.0" />
+    <param name="roi_y_min" value="-7.0" />
+    <param name="roi_y_max" value="7.0" />
+    <param name="roi_z_min" value="-1.5" />
+    <param name="roi_z_max" value="2.0" />
+
+    <!-- Ground -->
+    <param name="remove_ground" value="true" />
+    <param name="ground_dist_thresh" value="0.15" />
+    <param name="ground_max_iters" value="80" />
+
+    <!-- Clustering -->
+    <param name="cluster_tolerance" value="0.35" />
+    <param name="cluster_min_size" value="60" />
+    <param name="cluster_max_size" value="30000" />
+
+    <!-- Tracking -->
+    <param name="max_assoc_dist" value="1.2" />
+    <param name="smooth_alpha" value="0.25" />
+    <param name="track_timeout" value="0.6" />
+
+    <!-- Visualization -->
+    <param name="box_line_width" value="0.03" />
+    <param name="box_alpha" value="0.55" />
+    <param name="marker_lifetime" value="0.25" />
+  </node>
+</launch>
