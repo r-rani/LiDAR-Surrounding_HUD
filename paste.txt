@@ -1,31 +1,534 @@
-rosrun gr14 object_outlines \
-  _input_topic:=/unilidar/cloud \
-  _fixed_frame:=unilidar_lidar \
-  _x_min:=0.5 _x_max:=20.0 \
-  _y_min:=-4.0 _y_max:=4.0 \
-  _z_min:=-1.2 _z_max:=2.2 \
-  _ground_dist_thresh:=0.18 \
-  _cluster_tol:=0.35 \
-  _cluster_min:=120 \
-  _hull_alpha:=0.18
+#include <ros/ros.h>
 
+#include <sensor_msgs/PointCloud2.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <visualization_msgs/Marker.h>
 
-rosrun gr14 object_outlines _input_topic:=/unilidar/cloud _y_min:=-6 _y_max:=6 _cluster_tol:=0.25 _cluster_min:=40
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl_ros/point_cloud.h>
 
-cd ~/group14
-source devel/setup.bash
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/extract_indices.h>
 
-rosrun gr14 object_outlines \
-  _input_topic:=/unilidar/cloud \
-  _fixed_frame:=unilidar_lidar \
-  _voxel_leaf:=0.06 \
-  _x_min:=0.5 _x_max:=25.0 \
-  _y_min:=-8.0 _y_max:=8.0 \
-  _z_min:=-2.0 _z_max:=2.0 \
-  _ground_dist_thresh:=0.12 \
-  _ground_eps_angle_deg:=10.0 \
-  _wall_dist_thresh:=0.10 \
-  _min_wall_inliers:=250 \
-  _cluster_tolerance:=0.30 \
-  _cluster_min_size:=120 \
-  _hull_alpha:=0.20
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/segmentation/extract_clusters.h>
+
+#include <pcl/search/kdtree.h>
+#include <pcl/common/common.h>
+
+#include <unordered_map>
+#include <vector>
+#include <limits>
+#include <cmath>
+
+using PointT = pcl::PointXYZI;
+
+struct Detection
+{
+  Eigen::Vector3f centroid;
+  Eigen::Vector4f min_pt;
+  Eigen::Vector4f max_pt;
+  pcl::PointIndices indices;
+};
+
+struct Track
+{
+  int id = -1;
+  Eigen::Vector3f pos;        // smoothed centroid
+  Eigen::Vector4f min_pt;     // smoothed-ish bbox (we’ll smooth center; bbox updates directly)
+  Eigen::Vector4f max_pt;
+  ros::Time last_seen;
+  bool matched = false;
+};
+
+class ObjectBoxesTracker
+{
+public:
+  ObjectBoxesTracker(ros::NodeHandle& nh, ros::NodeHandle& pnh)
+  {
+    // Topics
+    pnh.param<std::string>("input_topic", input_topic_, std::string("/unilidar/cloud"));
+    pnh.param<std::string>("frame_id_override", frame_id_override_, std::string("")); // leave empty to use cloud header
+
+    // ROI crop (tune these for road clarity)
+    pnh.param("x_min", x_min_, -2.0);
+    pnh.param("x_max", x_max_, 25.0);
+    pnh.param("y_min", y_min_, -8.0);
+    pnh.param("y_max", y_max_, 8.0);
+    pnh.param("z_min", z_min_, -2.0);
+    pnh.param("z_max", z_max_, 2.0);
+
+    // Downsample
+    pnh.param("voxel_leaf", voxel_leaf_, 0.05);
+
+    // Plane removal (floor/walls)
+    pnh.param("remove_planes", remove_planes_, true);
+    pnh.param("plane_distance_thresh", plane_dist_thresh_, 0.12);
+    pnh.param("max_plane_iterations", max_plane_iters_, 80);
+    pnh.param("max_planes_to_remove", max_planes_to_remove_, 2);
+
+    // Clustering
+    pnh.param("cluster_tolerance", cluster_tol_, 0.45);
+    pnh.param("cluster_min_size", cluster_min_size_, 40);
+    pnh.param("cluster_max_size", cluster_max_size_, 20000);
+
+    // Tracking
+    pnh.param("track_gate_dist", track_gate_dist_, 1.2);     // meters: max centroid jump per frame
+    pnh.param("track_timeout", track_timeout_, 0.7);         // seconds: how long to keep a track after last seen
+    pnh.param("smoothing_alpha", alpha_, 0.30);              // EMA smoothing for centroid
+
+    // Marker
+    pnh.param("marker_lifetime", marker_lifetime_, 0.5);     // seconds
+    pnh.param("box_height_min", box_height_min_, 0.15);      // ignore flat noise clusters
+    pnh.param("box_height_max", box_height_max_, 5.0);       // safety cap
+
+    // Publishers
+    pub_objects_cloud_ = nh.advertise<sensor_msgs::PointCloud2>("/objects_cloud", 1);
+    pub_boxes_ = nh.advertise<visualization_msgs::MarkerArray>("/detected_boxes", 1);
+    pub_labels_ = nh.advertise<visualization_msgs::MarkerArray>("/detected_labels", 1);
+
+    // Subscriber
+    sub_cloud_ = nh.subscribe(input_topic_, 1, &ObjectBoxesTracker::cloudCb, this);
+
+    ROS_INFO("ObjectBoxesTracker running. Subscribed to: %s", input_topic_.c_str());
+  }
+
+private:
+  void cloudCb(const sensor_msgs::PointCloud2ConstPtr& msg)
+  {
+    ros::Time stamp = msg->header.stamp;
+
+    // Convert to PCL
+    pcl::PointCloud<PointT>::Ptr cloud_in(new pcl::PointCloud<PointT>());
+    pcl::fromROSMsg(*msg, *cloud_in);
+    if (cloud_in->empty()) return;
+
+    std::string frame = frame_id_override_.empty() ? msg->header.frame_id : frame_id_override_;
+
+    // 1) ROI crop
+    pcl::PointCloud<PointT>::Ptr cloud_roi(new pcl::PointCloud<PointT>());
+    cropXYZ(cloud_in, cloud_roi);
+
+    if (cloud_roi->empty()) return;
+
+    // 2) Voxel downsample
+    pcl::PointCloud<PointT>::Ptr cloud_ds(new pcl::PointCloud<PointT>());
+    voxelDownsample(cloud_roi, cloud_ds);
+    if (cloud_ds->empty()) return;
+
+    // 3) Remove planes (floor/walls) optionally
+    pcl::PointCloud<PointT>::Ptr cloud_np(new pcl::PointCloud<PointT>());
+    if (remove_planes_) {
+      removeDominantPlanes(cloud_ds, cloud_np);
+    } else {
+      cloud_np = cloud_ds;
+    }
+
+    if (cloud_np->empty()) {
+      publishEmpty(frame, stamp);
+      cleanupTracks(stamp);
+      return;
+    }
+
+    // 4) Cluster
+    std::vector<Detection> dets = clusterDetections(cloud_np);
+
+    // 5) Publish objects_cloud (only clustered points)
+    publishObjectsCloud(cloud_np, frame, stamp);
+
+    // 6) Tracking update
+    updateTracks(dets, stamp);
+
+    // 7) Publish markers
+    publishMarkers(frame, stamp);
+
+    // 8) Cleanup stale tracks (and send deletes if needed)
+    cleanupTracks(stamp);
+  }
+
+  void cropXYZ(const pcl::PointCloud<PointT>::Ptr& in, pcl::PointCloud<PointT>::Ptr& out)
+  {
+    pcl::PointCloud<PointT>::Ptr tmp(new pcl::PointCloud<PointT>());
+
+    pcl::PassThrough<PointT> pass;
+    pass.setInputCloud(in);
+
+    pass.setFilterFieldName("x");
+    pass.setFilterLimits(x_min_, x_max_);
+    pass.filter(*tmp);
+
+    pass.setInputCloud(tmp);
+    pass.setFilterFieldName("y");
+    pass.setFilterLimits(y_min_, y_max_);
+    pass.filter(*tmp);
+
+    pass.setInputCloud(tmp);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits(z_min_, z_max_);
+    pass.filter(*out);
+  }
+
+  void voxelDownsample(const pcl::PointCloud<PointT>::Ptr& in, pcl::PointCloud<PointT>::Ptr& out)
+  {
+    pcl::VoxelGrid<PointT> vg;
+    vg.setInputCloud(in);
+    vg.setLeafSize(voxel_leaf_, voxel_leaf_, voxel_leaf_);
+    vg.filter(*out);
+  }
+
+  void removeDominantPlanes(const pcl::PointCloud<PointT>::Ptr& in, pcl::PointCloud<PointT>::Ptr& out)
+  {
+    pcl::PointCloud<PointT>::Ptr working(new pcl::PointCloud<PointT>(*in));
+
+    pcl::SACSegmentation<PointT> seg;
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(pcl::SACMODEL_PLANE);
+    seg.setMethodType(pcl::SAC_RANSAC);
+    seg.setMaxIterations(max_plane_iters_);
+    seg.setDistanceThreshold(plane_dist_thresh_);
+
+    pcl::ExtractIndices<PointT> extract;
+
+    int planes_removed = 0;
+
+    while (planes_removed < max_planes_to_remove_ && working->size() > 200)
+    {
+      pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients());
+      pcl::PointIndices::Ptr inliers(new pcl::PointIndices());
+
+      seg.setInputCloud(working);
+      seg.segment(*inliers, *coeff);
+
+      if (inliers->indices.empty()) break;
+
+      // If plane is too small, stop
+      if ((int)inliers->indices.size() < 300) break;
+
+      extract.setInputCloud(working);
+      extract.setIndices(inliers);
+      extract.setNegative(true);
+
+      pcl::PointCloud<PointT>::Ptr filtered(new pcl::PointCloud<PointT>());
+      extract.filter(*filtered);
+
+      working = filtered;
+      planes_removed++;
+    }
+
+    *out = *working;
+  }
+
+  std::vector<Detection> clusterDetections(const pcl::PointCloud<PointT>::Ptr& cloud)
+  {
+    std::vector<Detection> dets;
+
+    pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>());
+    tree->setInputCloud(cloud);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<PointT> ec;
+    ec.setClusterTolerance(cluster_tol_);
+    ec.setMinClusterSize(cluster_min_size_);
+    ec.setMaxClusterSize(cluster_max_size_);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(cloud);
+    ec.extract(cluster_indices);
+
+    dets.reserve(cluster_indices.size());
+
+    for (const auto& ci : cluster_indices)
+    {
+      pcl::PointCloud<PointT>::Ptr cluster(new pcl::PointCloud<PointT>());
+      cluster->points.reserve(ci.indices.size());
+      for (int idx : ci.indices) cluster->points.push_back(cloud->points[idx]);
+
+      Eigen::Vector4f min_pt, max_pt;
+      pcl::getMinMax3D(*cluster, min_pt, max_pt);
+
+      float h = max_pt[2] - min_pt[2];
+      if (h < box_height_min_ || h > box_height_max_) continue;
+
+      // Centroid
+      Eigen::Vector4f c4;
+      pcl::compute3DCentroid(*cluster, c4);
+      Detection d;
+      d.centroid = Eigen::Vector3f(c4[0], c4[1], c4[2]);
+      d.min_pt = min_pt;
+      d.max_pt = max_pt;
+      d.indices = ci;
+
+      dets.push_back(d);
+    }
+
+    return dets;
+  }
+
+  void updateTracks(const std::vector<Detection>& dets, const ros::Time& stamp)
+  {
+    // mark all tracks unmatched
+    for (auto& kv : tracks_) kv.second.matched = false;
+
+    // Greedy matching: each detection -> closest unmatched track within gate
+    std::vector<bool> det_used(dets.size(), false);
+
+    for (size_t i = 0; i < dets.size(); ++i)
+    {
+      const auto& d = dets[i];
+
+      int best_id = -1;
+      float best_dist = std::numeric_limits<float>::max();
+
+      for (auto& kv : tracks_)
+      {
+        Track& t = kv.second;
+        if (t.matched) continue;
+
+        float dist = (t.pos - d.centroid).norm();
+        if (dist < best_dist) {
+          best_dist = dist;
+          best_id = t.id;
+        }
+      }
+
+      if (best_id != -1 && best_dist <= track_gate_dist_)
+      {
+        // update existing track
+        Track& t = tracks_[best_id];
+
+        // EMA smoothing on centroid
+        t.pos = alpha_ * d.centroid + (1.0f - alpha_) * t.pos;
+
+        // bbox update (you can smooth these too, but centroid smoothing already stabilizes)
+        t.min_pt = d.min_pt;
+        t.max_pt = d.max_pt;
+
+        t.last_seen = stamp;
+        t.matched = true;
+        det_used[i] = true;
+      }
+    }
+
+    // Create new tracks for unmatched detections
+    for (size_t i = 0; i < dets.size(); ++i)
+    {
+      if (det_used[i]) continue;
+
+      Track t;
+      t.id = next_id_++;
+      t.pos = dets[i].centroid;
+      t.min_pt = dets[i].min_pt;
+      t.max_pt = dets[i].max_pt;
+      t.last_seen = stamp;
+      t.matched = true;
+
+      tracks_[t.id] = t;
+    }
+  }
+
+  void publishMarkers(const std::string& frame, const ros::Time& stamp)
+  {
+    visualization_msgs::MarkerArray boxes;
+    visualization_msgs::MarkerArray labels;
+
+    for (const auto& kv : tracks_)
+    {
+      const Track& t = kv.second;
+
+      // If too old, skip publishing (cleanup will delete)
+      double age = (stamp - t.last_seen).toSec();
+      if (age > track_timeout_) continue;
+
+      // --- BOX as LINE_LIST (clearer than a solid cube)
+      visualization_msgs::Marker m;
+      m.header.frame_id = frame;
+      m.header.stamp = stamp;
+      m.ns = "boxes";
+      m.id = t.id;
+      m.type = visualization_msgs::Marker::LINE_LIST;
+      m.action = visualization_msgs::Marker::ADD;
+
+      // line thickness
+      m.scale.x = 0.03;
+
+      // green box
+      m.color.r = 0.1;
+      m.color.g = 1.0;
+      m.color.b = 0.1;
+      m.color.a = 1.0;
+
+      m.lifetime = ros::Duration(marker_lifetime_);
+
+      // build box corners from min/max
+      const float xmin = t.min_pt[0], ymin = t.min_pt[1], zmin = t.min_pt[2];
+      const float xmax = t.max_pt[0], ymax = t.max_pt[1], zmax = t.max_pt[2];
+
+      geometry_msgs::Point p[8];
+      // bottom (zmin)
+      p[0].x=xmin; p[0].y=ymin; p[0].z=zmin;
+      p[1].x=xmax; p[1].y=ymin; p[1].z=zmin;
+      p[2].x=xmax; p[2].y=ymax; p[2].z=zmin;
+      p[3].x=xmin; p[3].y=ymax; p[3].z=zmin;
+      // top (zmax)
+      p[4].x=xmin; p[4].y=ymin; p[4].z=zmax;
+      p[5].x=xmax; p[5].y=ymin; p[5].z=zmax;
+      p[6].x=xmax; p[6].y=ymax; p[6].z=zmax;
+      p[7].x=xmin; p[7].y=ymax; p[7].z=zmax;
+
+      auto addEdge = [&](int a, int b) {
+        m.points.push_back(p[a]);
+        m.points.push_back(p[b]);
+      };
+
+      // bottom rectangle
+      addEdge(0,1); addEdge(1,2); addEdge(2,3); addEdge(3,0);
+      // top rectangle
+      addEdge(4,5); addEdge(5,6); addEdge(6,7); addEdge(7,4);
+      // verticals
+      addEdge(0,4); addEdge(1,5); addEdge(2,6); addEdge(3,7);
+
+      boxes.markers.push_back(m);
+
+      // --- LABEL
+      visualization_msgs::Marker txt;
+      txt.header.frame_id = frame;
+      txt.header.stamp = stamp;
+      txt.ns = "labels";
+      txt.id = t.id;
+      txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+      txt.action = visualization_msgs::Marker::ADD;
+
+      txt.pose.position.x = t.pos.x();
+      txt.pose.position.y = t.pos.y();
+      txt.pose.position.z = t.max_pt[2] + 0.25;
+
+      txt.scale.z = 0.35;
+      txt.color.r = 1.0;
+      txt.color.g = 1.0;
+      txt.color.b = 1.0;
+      txt.color.a = 1.0;
+
+      double dist = std::sqrt(t.pos.x()*t.pos.x() + t.pos.y()*t.pos.y());
+      txt.text = "ID " + std::to_string(t.id) + "  d=" + std::to_string((int)dist) + "m";
+      txt.lifetime = ros::Duration(marker_lifetime_);
+
+      labels.markers.push_back(txt);
+    }
+
+    pub_boxes_.publish(boxes);
+    pub_labels_.publish(labels);
+  }
+
+  void cleanupTracks(const ros::Time& stamp)
+  {
+    // Delete stale tracks and send DELETE markers once
+    visualization_msgs::MarkerArray del_boxes;
+    visualization_msgs::MarkerArray del_labels;
+
+    std::vector<int> to_erase;
+
+    for (const auto& kv : tracks_)
+    {
+      const Track& t = kv.second;
+      double age = (stamp - t.last_seen).toSec();
+      if (age > track_timeout_)
+      {
+        // delete box marker
+        visualization_msgs::Marker m;
+        m.header.frame_id = frame_id_override_.empty() ? "" : frame_id_override_;
+        m.header.stamp = stamp;
+        m.ns = "boxes";
+        m.id = t.id;
+        m.action = visualization_msgs::Marker::DELETE;
+        del_boxes.markers.push_back(m);
+
+        // delete label marker
+        visualization_msgs::Marker l;
+        l.header.frame_id = frame_id_override_.empty() ? "" : frame_id_override_;
+        l.header.stamp = stamp;
+        l.ns = "labels";
+        l.id = t.id;
+        l.action = visualization_msgs::Marker::DELETE;
+        del_labels.markers.push_back(l);
+
+        to_erase.push_back(t.id);
+      }
+    }
+
+    if (!del_boxes.markers.empty()) pub_boxes_.publish(del_boxes);
+    if (!del_labels.markers.empty()) pub_labels_.publish(del_labels);
+
+    for (int id : to_erase) tracks_.erase(id);
+  }
+
+  void publishObjectsCloud(const pcl::PointCloud<PointT>::Ptr& cloud, const std::string& frame, const ros::Time& stamp)
+  {
+    sensor_msgs::PointCloud2 out;
+    pcl::toROSMsg(*cloud, out);
+    out.header.frame_id = frame;
+    out.header.stamp = stamp;
+    pub_objects_cloud_.publish(out);
+  }
+
+  void publishEmpty(const std::string& frame, const ros::Time& stamp)
+  {
+    sensor_msgs::PointCloud2 out;
+    out.header.frame_id = frame;
+    out.header.stamp = stamp;
+    pub_objects_cloud_.publish(out);
+
+    visualization_msgs::MarkerArray empty;
+    pub_boxes_.publish(empty);
+    pub_labels_.publish(empty);
+  }
+
+private:
+  ros::Subscriber sub_cloud_;
+  ros::Publisher pub_objects_cloud_;
+  ros::Publisher pub_boxes_;
+  ros::Publisher pub_labels_;
+
+  std::string input_topic_;
+  std::string frame_id_override_;
+
+  // ROI
+  double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
+
+  // Filters
+  double voxel_leaf_;
+  bool remove_planes_;
+  double plane_dist_thresh_;
+  int max_plane_iters_;
+  int max_planes_to_remove_;
+
+  // Cluster
+  double cluster_tol_;
+  int cluster_min_size_;
+  int cluster_max_size_;
+
+  // Tracking
+  double track_gate_dist_;
+  double track_timeout_;
+  double alpha_;
+
+  // Marker
+  double marker_lifetime_;
+  double box_height_min_;
+  double box_height_max_;
+
+  std::unordered_map<int, Track> tracks_;
+  int next_id_ = 0;
+};
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "object_boxes_tracker");
+  ros::NodeHandle nh;
+  ros::NodeHandle pnh("~");
+
+  ObjectBoxesTracker node(nh, pnh);
+
+  ros::spin();
+  return 0;
+}
