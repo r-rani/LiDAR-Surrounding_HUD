@@ -16,7 +16,9 @@ find_package(PCL REQUIRED COMPONENTS
   io
   filters
   segmentation
+  kdtree
   search
+  sample_consensus
 )
 
 catkin_package()
