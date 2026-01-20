@@ -1,0 +1,5 @@
+rosrun gr14 object_boxes_tracker _input_topic:=/unilidar/cloud \
+  _voxel_leaf:=0.06 _z_min:=-1.5 _z_max:=2.5 \
+  _remove_ground:=true _ground_dist_thresh:=0.08 \
+  _cluster_tol:=0.35 _cluster_min:=70 _cluster_max:=30000 \
+  _assoc_dist:=0.8 _track_timeout:=1.0
