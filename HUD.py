@@ -1,152 +1,121 @@
-#!/usr/bin/env python3
 import cv2
 import numpy as np
-import time
-import math
 
-# =========================================================
+# =========================
 # SETTINGS
-# =========================================================
-
-# Change these to match the monitor/projector resolution
+# =========================
 SCREEN_W = 1920
 SCREEN_H = 1080
 
-# If the HUD monitor is the ONLY display, leave these at 0,0
-# If using extended desktop and the HUD monitor is to the right
-# of a 1920x1080 laptop screen, set DISPLAY_X = 1920, DISPLAY_Y = 0
 DISPLAY_X = 0
 DISPLAY_Y = 0
 
 WINDOW_NAME = "HUD"
 
-# HUD box settings
-BOX_W = 420
-BOX_H = 260
-BOX_COLOR = (255, 0, 255)   # magenta in BGR
-BOX_THICKNESS = 3
-GLOW = True
+MIRROR = True
+SMOOTHING = 0.7   # higher = smoother, slower
 
-# Set True if you want the box centered
-CENTER_BOX = True
+# Load person detector
+hog = cv2.HOGDescriptor()
+hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
-# If CENTER_BOX = False, these are used
-BOX_X = 700
-BOX_Y = 400
+# Camera
+cap = cv2.VideoCapture(0)
+cap.set(3, 640)
+cap.set(4, 480)
 
-# Optional crosshair
-DRAW_CENTER_DOT = False
+# Previous box for smoothing
+prev_box = None
 
-# Optional FPS text
-SHOW_FPS = False
 
-# =========================================================
-# DRAW HELPERS
-# =========================================================
+# =========================
+# FUNCTIONS
+# =========================
+def smooth_box(prev, new):
+    if prev is None:
+        return new
+    px, py, pw, ph = prev
+    nx, ny, nw, nh = new
 
-def draw_glow_rect(img, pt1, pt2, color):
-    if GLOW:
-        overlay = img.copy()
-        cv2.rectangle(overlay, pt1, pt2, color, 14)
-        cv2.addWeighted(overlay, 0.05, img, 0.95, 0, img)
+    sx = int(px * SMOOTHING + nx * (1 - SMOOTHING))
+    sy = int(py * SMOOTHING + ny * (1 - SMOOTHING))
+    sw = int(pw * SMOOTHING + nw * (1 - SMOOTHING))
+    sh = int(ph * SMOOTHING + nh * (1 - SMOOTHING))
 
-        overlay = img.copy()
-        cv2.rectangle(overlay, pt1, pt2, color, 8)
-        cv2.addWeighted(overlay, 0.08, img, 0.92, 0, img)
+    return (sx, sy, sw, sh)
 
-        overlay = img.copy()
-        cv2.rectangle(overlay, pt1, pt2, color, 4)
-        cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
-    cv2.rectangle(img, pt1, pt2, color, BOX_THICKNESS)
+def draw_hud_box(frame, x1, y1, x2, y2):
+    color = (255, 0, 255)
 
-def draw_corner_markers(img, x1, y1, x2, y2, color, length=32, thickness=2):
-    # top-left
-    cv2.line(img, (x1, y1), (x1 + length, y1), color, thickness)
-    cv2.line(img, (x1, y1), (x1, y1 + length), color, thickness)
+    # Glow effect
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 12)
+    cv2.addWeighted(overlay, 0.05, frame, 0.95, 0, frame)
 
-    # top-right
-    cv2.line(img, (x2, y1), (x2 - length, y1), color, thickness)
-    cv2.line(img, (x2, y1), (x2, y1 + length), color, thickness)
+    # Main box
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # bottom-left
-    cv2.line(img, (x1, y2), (x1 + length, y2), color, thickness)
-    cv2.line(img, (x1, y2), (x1, y2 - length), color, thickness)
 
-    # bottom-right
-    cv2.line(img, (x2, y2), (x2 - length, y2), color, thickness)
-    cv2.line(img, (x2, y2), (x2, y2 - length), color, thickness)
+# =========================
+# WINDOW SETUP
+# =========================
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.moveWindow(WINDOW_NAME, DISPLAY_X, DISPLAY_Y)
+cv2.resizeWindow(WINDOW_NAME, SCREEN_W, SCREEN_H)
+cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-def get_box_coords():
-    if CENTER_BOX:
-        x1 = (SCREEN_W - BOX_W) // 2
-        y1 = (SCREEN_H - BOX_H) // 2
-    else:
-        x1 = BOX_X
-        y1 = BOX_Y
 
-    x2 = x1 + BOX_W
-    y2 = y1 + BOX_H
+# =========================
+# MAIN LOOP
+# =========================
+while True:
+    ret, cam = cap.read()
+    if not ret:
+        break
 
-    # clamp
-    x1 = max(0, min(x1, SCREEN_W - 1))
-    y1 = max(0, min(y1, SCREEN_H - 1))
-    x2 = max(0, min(x2, SCREEN_W - 1))
-    y2 = max(0, min(y2, SCREEN_H - 1))
+    if MIRROR:
+        cam = cv2.flip(cam, 1)
 
-    return x1, y1, x2, y2
+    gray = cv2.cvtColor(cam, cv2.COLOR_BGR2GRAY)
 
-# =========================================================
-# MAIN
-# =========================================================
+    # Detect people
+    boxes, _ = hog.detectMultiScale(
+        gray,
+        winStride=(8, 8),
+        padding=(8, 8),
+        scale=1.05
+    )
 
-def main():
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    # Create black HUD canvas
+    hud = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
 
-    # Make it borderless/fullscreen
-    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    if len(boxes) > 0:
+        # Take largest detected person
+        largest = max(boxes, key=lambda b: b[2] * b[3])
+        x, y, w, h = largest
 
-    # Move it onto the HUD monitor
-    cv2.moveWindow(WINDOW_NAME, DISPLAY_X, DISPLAY_Y)
+        # Smooth movement
+        smooth = smooth_box(prev_box, (x, y, w, h))
+        prev_box = smooth
 
-    prev = time.time()
+        x, y, w, h = smooth
 
-    while True:
-        # Full black canvas
-        frame = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
+        # Scale camera coords to screen
+        scale_x = SCREEN_W / cam.shape[1]
+        scale_y = SCREEN_H / cam.shape[0]
 
-        x1, y1, x2, y2 = get_box_coords()
+        x1 = int(x * scale_x)
+        y1 = int(y * scale_y)
+        x2 = int((x + w) * scale_x)
+        y2 = int((y + h) * scale_y)
 
-        draw_glow_rect(frame, (x1, y1), (x2, y2), BOX_COLOR)
-        draw_corner_markers(frame, x1, y1, x2, y2, BOX_COLOR)
+        draw_hud_box(hud, x1, y1, x2, y2)
 
-        if DRAW_CENTER_DOT:
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            cv2.circle(frame, (cx, cy), 3, BOX_COLOR, -1)
+    cv2.imshow(WINDOW_NAME, hud)
 
-        if SHOW_FPS:
-            now = time.time()
-            fps = 1.0 / max(now - prev, 1e-6)
-            prev = now
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.1f}",
-                (40, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA
-            )
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
-        cv2.imshow(WINDOW_NAME, frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord("q"):
-            break
-
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+cap.release()
+cv2.destroyAllWindows()
