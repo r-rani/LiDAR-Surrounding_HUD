@@ -292,7 +292,9 @@ def main():
             fps_t0, fps_count = time.time(), 0
         cv2.putText(out, f"FPS {fps:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 3)
 
-        cv2.imshow("HUD", out)
+        #cv2.imshow("HUD", out)
+        flipped = cv2.flip(out, 1)   # horizontal flip (HUD mode)
+        cv2.imshow("HUD", flipped)
         if cv2.waitKey(1) & 0xFF in (27, ord('q')): break
 
     cap.release()
