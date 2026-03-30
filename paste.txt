@@ -199,7 +199,7 @@ def main():
     cv2.createTrackbar("Zone Bottom Y %",  CTRL_WIN, 92, 99,  lambda x: None)
     cv2.createTrackbar("Zone Top W %",     CTRL_WIN, 22, 90,  lambda x: None)
     cv2.createTrackbar("Zone Bot W %",     CTRL_WIN, 92, 100, lambda x: None)
-    cv2.createTrackbar("Filter in Zone",   CTRL_WIN,  1,  1,  lambda x: None)
+    cv2.createTrackbar("Filter in Zone",   CTRL_WIN,  0,  1,  lambda x: None)
     cv2.createTrackbar("Keep Boxes TTL",   CTRL_WIN,  8, 30,  lambda x: None)
 
     # Processing resolution — lower = faster, 1 = 1280x720, 2 = 960x540
