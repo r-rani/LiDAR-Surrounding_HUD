@@ -1,277 +1,152 @@
 #!/usr/bin/env python3
-
-import argparse
-import time
-
 import cv2
 import numpy as np
+import time
+import math
 
+# =========================================================
+# SETTINGS
+# =========================================================
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+# Change these to match the monitor/projector resolution
+SCREEN_W = 1920
+SCREEN_H = 1080
 
+# If the HUD monitor is the ONLY display, leave these at 0,0
+# If using extended desktop and the HUD monitor is to the right
+# of a 1920x1080 laptop screen, set DISPLAY_X = 1920, DISPLAY_Y = 0
+DISPLAY_X = 0
+DISPLAY_Y = 0
 
-def iou(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
+WINDOW_NAME = "HUD"
 
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
+# HUD box settings
+BOX_W = 420
+BOX_H = 260
+BOX_COLOR = (255, 0, 255)   # magenta in BGR
+BOX_THICKNESS = 3
+GLOW = True
 
-    iw = max(0, inter_x2 - inter_x1)
-    ih = max(0, inter_y2 - inter_y1)
-    inter = iw * ih
+# Set True if you want the box centered
+CENTER_BOX = True
 
-    if inter <= 0:
-        return 0.0
+# If CENTER_BOX = False, these are used
+BOX_X = 700
+BOX_Y = 400
 
-    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+# Optional crosshair
+DRAW_CENTER_DOT = False
 
-    return inter / float(area_a + area_b - inter + 1e-9)
+# Optional FPS text
+SHOW_FPS = False
 
+# =========================================================
+# DRAW HELPERS
+# =========================================================
 
-# -----------------------------
-# Simple tracker
-# Keeps boxes alive briefly so they do not flicker
-# -----------------------------
-class SimpleTracker:
-    def __init__(self, iou_thresh=0.25, ttl=8):
-        self.iou_thresh = iou_thresh
-        self.ttl = ttl
-        self.next_id = 1
-        self.tracks = {}
+def draw_glow_rect(img, pt1, pt2, color):
+    if GLOW:
+        overlay = img.copy()
+        cv2.rectangle(overlay, pt1, pt2, color, 14)
+        cv2.addWeighted(overlay, 0.05, img, 0.95, 0, img)
 
-    def update(self, dets):
-        # Age existing tracks
-        for tid in list(self.tracks.keys()):
-            self.tracks[tid]["ttl"] -= 1
-            if self.tracks[tid]["ttl"] <= 0:
-                del self.tracks[tid]
+        overlay = img.copy()
+        cv2.rectangle(overlay, pt1, pt2, color, 8)
+        cv2.addWeighted(overlay, 0.08, img, 0.92, 0, img)
 
-        used = set()
+        overlay = img.copy()
+        cv2.rectangle(overlay, pt1, pt2, color, 4)
+        cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
-        # Match detections to existing tracks
-        for tid, tr in list(self.tracks.items()):
-            best_iou = 0.0
-            best_j = -1
+    cv2.rectangle(img, pt1, pt2, color, BOX_THICKNESS)
 
-            for j, d in enumerate(dets):
-                if j in used:
-                    continue
-                if d["cls"] != tr["cls"]:
-                    continue
+def draw_corner_markers(img, x1, y1, x2, y2, color, length=32, thickness=2):
+    # top-left
+    cv2.line(img, (x1, y1), (x1 + length, y1), color, thickness)
+    cv2.line(img, (x1, y1), (x1, y1 + length), color, thickness)
 
-                val = iou(tr["box"], d["box"])
-                if val > best_iou:
-                    best_iou = val
-                    best_j = j
+    # top-right
+    cv2.line(img, (x2, y1), (x2 - length, y1), color, thickness)
+    cv2.line(img, (x2, y1), (x2, y1 + length), color, thickness)
 
-            if best_j != -1 and best_iou >= self.iou_thresh:
-                d = dets[best_j]
-                used.add(best_j)
-                self.tracks[tid] = {
-                    "box": d["box"],
-                    "cls": d["cls"],
-                    "conf": d["conf"],
-                    "ttl": self.ttl,
-                }
+    # bottom-left
+    cv2.line(img, (x1, y2), (x1 + length, y2), color, thickness)
+    cv2.line(img, (x1, y2), (x1, y2 - length), color, thickness)
 
-        # Add new tracks
-        for j, d in enumerate(dets):
-            if j in used:
-                continue
+    # bottom-right
+    cv2.line(img, (x2, y2), (x2 - length, y2), color, thickness)
+    cv2.line(img, (x2, y2), (x2, y2 - length), color, thickness)
 
-            tid = self.next_id
-            self.next_id += 1
-            self.tracks[tid] = {
-                "box": d["box"],
-                "cls": d["cls"],
-                "conf": d["conf"],
-                "ttl": self.ttl,
-            }
-
-        out = []
-        for tid, tr in self.tracks.items():
-            out.append({
-                "id": tid,
-                "box": tr["box"],
-                "cls": tr["cls"],
-                "conf": tr["conf"],
-            })
-        return out
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", type=int, default=0, help="Camera index")
-    ap.add_argument("--video", type=str, default=None, help="Optional video file")
-    ap.add_argument("--prototxt", type=str, default="MobileNetSSD_deploy.prototxt")
-    ap.add_argument("--model", type=str, default="MobileNetSSD_deploy.caffemodel")
-    ap.add_argument("--conf", type=float, default=0.40)
-    ap.add_argument("--skip", type=int, default=1, help="Frames to skip between reads")
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=360)
-    ap.add_argument("--fullscreen", action="store_true")
-    args = ap.parse_args()
-
-    # Open source
-    if args.video:
-        cap = cv2.VideoCapture(args.video)
+def get_box_coords():
+    if CENTER_BOX:
+        x1 = (SCREEN_W - BOX_W) // 2
+        y1 = (SCREEN_H - BOX_H) // 2
     else:
-        cap = cv2.VideoCapture(args.source)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        x1 = BOX_X
+        y1 = BOX_Y
 
-    if not cap.isOpened():
-        print("[ERROR] Could not open video source")
-        return
+    x2 = x1 + BOX_W
+    y2 = y1 + BOX_H
 
-    # Load DNN
-    net = cv2.dnn.readNetFromCaffe(args.prototxt, args.model)
+    # clamp
+    x1 = max(0, min(x1, SCREEN_W - 1))
+    y1 = max(0, min(y1, SCREEN_H - 1))
+    x2 = max(0, min(x2, SCREEN_W - 1))
+    y2 = max(0, min(y2, SCREEN_H - 1))
 
-    # Window
-    cv2.namedWindow("HUD", cv2.WINDOW_NORMAL)
-    if args.fullscreen:
-        cv2.setWindowProperty("HUD", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    return x1, y1, x2, y2
 
-    tracker = SimpleTracker(iou_thresh=0.25, ttl=8)
+# =========================================================
+# MAIN
+# =========================================================
 
-    fps_t0 = time.time()
-    fps_count = 0
-    fps = 0.0
+def main():
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
-    # MobileNet SSD classes of interest
-    label_map = {
-        15: "person",
-        7: "car",
-        6: "bus",
-        14: "motorbike",
-        2: "bicycle",
-    }
+    # Make it borderless/fullscreen
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    detect_every = 2
-    cached_detections = []
+    # Move it onto the HUD monitor
+    cv2.moveWindow(WINDOW_NAME, DISPLAY_X, DISPLAY_Y)
+
+    prev = time.time()
 
     while True:
-        # Skip frames to improve FPS
-        for _ in range(args.skip):
-            cap.grab()
+        # Full black canvas
+        frame = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
 
-        ok, frame = cap.read()
-        if not ok:
-            break
+        x1, y1, x2, y2 = get_box_coords()
 
-        frame = cv2.resize(frame, (args.width, args.height))
-        h, w = frame.shape[:2]
+        draw_glow_rect(frame, (x1, y1), (x2, y2), BOX_COLOR)
+        draw_corner_markers(frame, x1, y1, x2, y2, BOX_COLOR)
 
-        # Run DNN every N frames
-        if fps_count % detect_every == 0:
-            blob = cv2.dnn.blobFromImage(
-                cv2.resize(frame, (300, 300)),
-                scalefactor=0.007843,
-                size=(300, 300),
-                mean=127.5
-            )
-            net.setInput(blob)
-            dets = net.forward()
+        if DRAW_CENTER_DOT:
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            cv2.circle(frame, (cx, cy), 3, BOX_COLOR, -1)
 
-            detections = []
-            for i in range(dets.shape[2]):
-                conf = float(dets[0, 0, i, 2])
-                idx = int(dets[0, 0, i, 1])
-
-                if conf < args.conf:
-                    continue
-                if idx not in label_map:
-                    continue
-
-                box = dets[0, 0, i, 3:7] * np.array([w, h, w, h])
-                x1, y1, x2, y2 = box.astype(int)
-
-                x1 = clamp(x1, 0, w - 1)
-                y1 = clamp(y1, 0, h - 1)
-                x2 = clamp(x2, 0, w - 1)
-                y2 = clamp(y2, 0, h - 1)
-
-                if x2 <= x1 or y2 <= y1:
-                    continue
-
-                detections.append({
-                    "box": (x1, y1, x2, y2),
-                    "cls": label_map[idx],
-                    "conf": conf
-                })
-
-            cached_detections = detections
-
-        tracks = tracker.update(cached_detections)
-
-        # -----------------------------
-        # BLACK HUD BACKGROUND
-        # -----------------------------
-        out = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # Draw only object boxes
-        for t in tracks:
-            x1, y1, x2, y2 = t["box"]
-
-            if t["cls"] == "person":
-                color = (255, 0, 255)   # purple
-            else:
-                color = (0, 255, 0)     # green
-
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-
-            label = f"{t['cls']} {t['conf']:.2f}"
+        if SHOW_FPS:
+            now = time.time()
+            fps = 1.0 / max(now - prev, 1e-6)
+            prev = now
             cv2.putText(
-                out,
-                label,
-                (x1, max(18, y1 - 8)),
+                frame,
+                f"FPS: {fps:.1f}",
+                (40, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1
+                1.0,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
             )
 
-        # FPS
-        fps_count += 1
-        now = time.time()
-        if (now - fps_t0) >= 0.5:
-            fps = fps_count / (now - fps_t0)
-            fps_t0 = now
-            fps_count = 0
-
-        cv2.putText(
-            out,
-            f"FPS {fps:.1f}",
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2
-        )
-
-        # Flip for HUD reflection
-        flipped = cv2.flip(out, 1)
-
-        cv2.imshow("HUD", flipped)
+        cv2.imshow(WINDOW_NAME, frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord("q"):
             break
 
-    cap.release()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
