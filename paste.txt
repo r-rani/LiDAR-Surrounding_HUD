@@ -201,6 +201,7 @@ def main():
     cv2.createTrackbar("Zone Bot W %",     CTRL_WIN, 92, 100, lambda x: None)
     cv2.createTrackbar("Filter in Zone",   CTRL_WIN,  0,  1,  lambda x: None)
     cv2.createTrackbar("Keep Boxes TTL",   CTRL_WIN,  8, 30,  lambda x: None)
+    cv2.createTrackbar("Camera Preview",   CTRL_WIN,  0,  1,  lambda x: None)
 
     # Processing resolution — lower = faster, 1 = 1280x720, 2 = 960x540
     PROC_W, PROC_H = 1920, 1080
@@ -263,7 +264,11 @@ def main():
             pass  # keep using last known tracks
 
         # 6. Rendering — reuse pre-allocated buffer
-        out_buf[:] = 0
+        camera_preview = cv2.getTrackbarPos("Camera Preview", CTRL_WIN) == 1
+        if camera_preview:
+            np.copyto(out_buf, frame)
+        else:
+            out_buf[:] = 0
         overlay = out_buf.copy()
         cv2.fillPoly(overlay, [zone], (0, 255, 0))
         cv2.addWeighted(overlay, 0.22, out_buf, 0.78, 0, dst=out_buf)
