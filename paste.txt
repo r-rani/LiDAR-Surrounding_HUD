@@ -203,7 +203,7 @@ def main():
     cv2.createTrackbar("Keep Boxes TTL",   CTRL_WIN,  8, 30,  lambda x: None)
 
     # Processing resolution — lower = faster, 1 = 1280x720, 2 = 960x540
-    PROC_W, PROC_H = 1280, 720
+    PROC_W, PROC_H = 1920, 1080
 
     label_map = {15: "person", 7: "car", 6: "bus", 14: "motorbike", 2: "bicycle"}
     tracker   = SimpleTracker(iou_thresh=0.25, ttl=8)
@@ -218,6 +218,7 @@ def main():
     latest_tracks = []
 
     cv2.namedWindow("HUD", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("HUD", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     while True:
         for _ in range(args.skip): cap.grab()
