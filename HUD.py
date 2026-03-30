@@ -110,50 +110,6 @@ class SimpleTracker:
         return out
 
 # -----------------------------
-# Lane detection (Canny + Hough)
-# -----------------------------
-def detect_lane_lines(frame_bgr, roi_poly, canny1, canny2, hough_thresh, min_len, max_gap):
-    h, w = frame_bgr.shape[:2]
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, canny1, canny2)
-
-    mask = np.zeros_like(edges)
-    cv2.fillPoly(mask, [roi_poly.astype(np.int32)], 255)
-    masked = cv2.bitwise_and(edges, mask)
-
-    lines = cv2.HoughLinesP(masked, 1, np.pi/180, hough_thresh,
-                            minLineLength=min_len, maxLineGap=max_gap)
-
-    left, right = [], []
-    if lines is not None:
-        for l in lines[:, 0]:
-            x1, y1, x2, y2 = l
-            if x2 == x1: continue
-            slope = (y2 - y1) / float(x2 - x1)
-            if abs(slope) < 0.4: continue
-            if slope < 0: left.append((x1, y1, x2, y2))
-            else: right.append((x1, y1, x2, y2))
-
-    def fit_line(segments):
-        if not segments: return None
-        xs, ys = [], []
-        for x1, y1, x2, y2 in segments:
-            xs += [x1, x2]; ys += [y1, y2]
-        m, b = np.polyfit(ys, xs, 1)
-        return m, b
-
-    y_top = int(np.min(roi_poly[:, 1]))
-    y_bot = int(np.max(roi_poly[:, 1]))
-
-    def endpoints(fit):
-        if fit is None: return None
-        m, b = fit
-        return (int(m * y_top + b), y_top, int(m * y_bot + b), y_bot)
-
-    return endpoints(fit_line(left)), endpoints(fit_line(right)), masked
-
-# -----------------------------
 # Main
 # -----------------------------
 def main():
@@ -183,24 +139,15 @@ def main():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CTRL_WIN, 520, 500)
 
-    # UPDATED: Zoom preset is now 33 (3.3x) by default
     cv2.createTrackbar("Digital Zoom x10", CTRL_WIN, 33, 40, lambda x: None)
-    
     cv2.createTrackbar("Zone Center X %", CTRL_WIN, 50, 100, lambda x: None)
     cv2.createTrackbar("Zone Top Y %",    CTRL_WIN, 55, 95,  lambda x: None)
     cv2.createTrackbar("Zone Bottom Y %", CTRL_WIN, 92, 99,  lambda x: None)
     cv2.createTrackbar("Zone Top W %",    CTRL_WIN, 22, 90,  lambda x: None)
     cv2.createTrackbar("Zone Bot W %",    CTRL_WIN, 92, 100, lambda x: None)
-    cv2.createTrackbar("Canny1",          CTRL_WIN, 60, 255, lambda x: None)
-    cv2.createTrackbar("Canny2",          CTRL_WIN, 150, 255, lambda x: None)
-    cv2.createTrackbar("Hough Thresh",    CTRL_WIN, 40, 200, lambda x: None)
-    cv2.createTrackbar("Min Line Len",    CTRL_WIN, 50, 400, lambda x: None)
-    cv2.createTrackbar("Max Line Gap",    CTRL_WIN, 90, 400, lambda x: None)
-    cv2.createTrackbar("Smooth %",        CTRL_WIN, 70, 99,  lambda x: None)
     cv2.createTrackbar("Filter in Zone",  CTRL_WIN, 1, 1,    lambda x: None)
     cv2.createTrackbar("Keep Boxes TTL",  CTRL_WIN, 8, 30,   lambda x: None)
 
-    prev_left, prev_right = None, None
     tracker = SimpleTracker(iou_thresh=0.25, ttl=8)
     fps_t0, fps_count, fps = time.time(), 0, 0.0
 
@@ -211,7 +158,7 @@ def main():
         ok, frame = cap.read()
         if not ok: break
 
-        # 1. Digital Zoom (Applied FIRST so detection happens on zoomed frame)
+        # 1. Digital Zoom
         zoom_val = cv2.getTrackbarPos("Digital Zoom x10", CTRL_WIN) / 10.0
         frame = apply_zoom(frame, zoom_val)
         
@@ -225,7 +172,6 @@ def main():
         boty_pct = cv2.getTrackbarPos("Zone Bottom Y %", CTRL_WIN) / 100.0
         topw_pct = cv2.getTrackbarPos("Zone Top W %", CTRL_WIN) / 100.0
         botw_pct = cv2.getTrackbarPos("Zone Bot W %", CTRL_WIN) / 100.0
-        alpha = clamp(cv2.getTrackbarPos("Smooth %", CTRL_WIN) / 100.0, 0.0, 0.99)
 
         # 3. Trapezoid setup
         cx = int(w * cx_pct)
@@ -236,17 +182,7 @@ def main():
         zone = np.array([[cx - bot_half, y_bot], [cx - top_half, y_top],
                          [cx + top_half, y_top], [cx + bot_half, y_bot]], dtype=np.int32)
 
-        # 4. Lanes & DNN
-        left_line, right_line, _ = detect_lane_lines(frame, zone, 
-                                    cv2.getTrackbarPos("Canny1", CTRL_WIN),
-                                    cv2.getTrackbarPos("Canny2", CTRL_WIN),
-                                    cv2.getTrackbarPos("Hough Thresh", CTRL_WIN),
-                                    cv2.getTrackbarPos("Min Line Len", CTRL_WIN),
-                                    cv2.getTrackbarPos("Max Line Gap", CTRL_WIN))
-
-        if left_line: prev_left = tuple(int(ema(p, c, alpha)) for p, c in zip(prev_left, left_line)) if prev_left else left_line
-        if right_line: prev_right = tuple(int(ema(p, c, alpha)) for p, c in zip(prev_right, right_line)) if prev_right else right_line
-
+        # 4. DNN detection
         blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
         net.setInput(blob)
         dets = net.forward() if fps_count % 2 == 0 else np.zeros((1, 1, 0, 7))
@@ -268,15 +204,11 @@ def main():
         tracks = tracker.update(detections)
 
         # 5. Rendering
-        #out = frame.copy()
         out = np.zeros_like(frame)
         overlay = out.copy()
         cv2.fillPoly(overlay, [zone], (0, 255, 0))
         out = cv2.addWeighted(overlay, 0.22, out, 0.78, 0)
         cv2.polylines(out, [zone], True, (255, 255, 0), 4)
-
-        for line in [prev_left, prev_right]:
-            if line: cv2.line(out, (line[0], line[1]), (line[2], line[3]), (0, 255, 255), 6)
 
         cv2.line(out, (cx, y_bot), (cx, int((y_top + y_bot) / 2)), (0, 0, 255), 8)
 
@@ -293,7 +225,6 @@ def main():
             fps_t0, fps_count = time.time(), 0
         cv2.putText(out, f"FPS {fps:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 3)
 
-        #cv2.imshow("HUD", out)
         flipped = cv2.flip(out, 1)   # horizontal flip (HUD mode)
         cv2.imshow("HUD", flipped)
         if cv2.waitKey(1) & 0xFF in (27, ord('q')): break
